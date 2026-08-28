@@ -1,0 +1,4 @@
+# assembled overlays and outputs are never committed here
+**/files-assembled/
+*.bin
+*.log
