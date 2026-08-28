@@ -56,6 +56,12 @@ if [ "$use_private" = 1 ]; then
 fi
 # strip .gitkeep placeholders so they don't land in the rootfs
 find "$FILES" -name .gitkeep -delete 2>/dev/null || true
+# Normalize permissions: git cannot carry directory modes, so a contributor
+# umask of 0002 bakes group-writable dirs into the rootfs — dropbear then
+# refuses ALL pubkey auth ("/etc/dropbear must be owned by user or root, and
+# not writable by group or others"), masked by blank-password auth until a
+# password is set. Strip group/other write from everything in the overlay.
+chmod -R go-w "$FILES"
 
 # --- configure from the seed ---
 echo "==> applying seed"
