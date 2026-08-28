@@ -60,6 +60,7 @@ find "$FILES" -name .gitkeep -delete 2>/dev/null || true
 # --- configure from the seed ---
 echo "==> applying seed"
 cp "$PROF/seed" "$TREE/.config"
+grep -q '^CONFIG_DEVEL=y'  "$TREE/.config" || echo 'CONFIG_DEVEL=y'  >> "$TREE/.config"
 grep -q '^CONFIG_CCACHE=y' "$TREE/.config" || echo 'CONFIG_CCACHE=y' >> "$TREE/.config"
 ( cd "$TREE" && make defconfig >/dev/null )
 
