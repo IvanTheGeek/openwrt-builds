@@ -69,6 +69,18 @@ cp "$PROF/seed" "$TREE/.config"
 grep -q '^CONFIG_DEVEL=y'  "$TREE/.config" || echo 'CONFIG_DEVEL=y'  >> "$TREE/.config"
 grep -q '^CONFIG_CCACHE=y' "$TREE/.config" || echo 'CONFIG_CCACHE=y' >> "$TREE/.config"
 ( cd "$TREE" && make defconfig >/dev/null )
+# Guard: defconfig silently DROPS unknown symbols (e.g. luci packages when the
+# tree's feeds are not installed). Every =y package the seed asked for must
+# survive into .config — otherwise fail loudly listing the losses.
+dropped=$(grep '^CONFIG_PACKAGE_.*=y' "$PROF/seed" | while read -r line; do
+  grep -qxF "$line" "$TREE/.config" || echo "    $line"
+done)
+if [ -n "$dropped" ]; then
+  echo "ERROR: defconfig dropped seed packages (feeds not installed in $TREE?):" >&2
+  echo "$dropped" >&2
+  echo "  fix: cd $TREE && ./scripts/feeds update -a && ./scripts/feeds install -a" >&2
+  exit 1
+fi
 
 # --- build ---
 echo "==> building (this can take a while; ccache warms subsequent runs)"
