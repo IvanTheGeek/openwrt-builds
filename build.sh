@@ -33,6 +33,16 @@ PROF="$REPO_DIR/profiles/$profile"
 [ -d "$PROF" ] || { echo "no such profile: $profile (see $REPO_DIR/profiles/)" >&2; exit 2; }
 [ -f "$PROF/seed" ] || { echo "profile '$profile' has no seed file" >&2; exit 2; }
 
+# A PARKED profile documents a device we CANNOT build yet (no upstream target, etc). Its seed
+# selects no target, so defconfig would silently fall back to the x86 default and emit a useless
+# image that looks like a successful build. Refuse loudly instead.
+if [ -f "$PROF/PARKED" ]; then
+  echo "⛔ profile '$profile' is PARKED and cannot be built:" >&2
+  sed 's/^/   /' "$PROF/PARKED" >&2
+  echo "   See $PROF/README.md for the full reasoning." >&2
+  exit 3
+fi
+
 if [ "$mainline" = 1 ]; then TREE="$MAINLINE"; flavor="mainline"; else TREE="$HOMELAB"; flavor="homelab"; fi
 [ -d "$TREE" ] || { echo "buildroot not found: $TREE" >&2; exit 1; }
 echo "==> profile=$profile  flavor=$flavor  tree=$TREE  jobs=$jobs"

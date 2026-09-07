@@ -1,0 +1,3 @@
+No upstream OpenWrt target exists for IPQ5332 (ipq53xx).
+Mainline has qualcommax/{ipq50xx,ipq60xx,ipq807x} and qualcommbe/ipq95xx only.
+Port work lives on branch port/ipq53xx-be9300 (worktree ~/openwrt-be9300).
