@@ -93,13 +93,6 @@ if [ -n "$dropped" ]; then
 fi
 
 # --- build ---
-# Clear previous artifacts FIRST. bin/targets/ persists across builds, so the collector
-# below would otherwise sweep up a stale image from a DIFFERENT profile — which happened
-# on 2026-09-08: a wr3000p-v1 image from the 2026-08-30 mule build (carrying the mule's
-# private key) was collected into the wr3000h-base output dir. The H and P images are
-# dangerously easy to confuse, so this is a flashing hazard, not just untidiness.
-echo "==> clearing previous artifacts ($TREE/bin/targets)"
-rm -rf "$TREE/bin/targets"
 echo "==> building (this can take a while; ccache warms subsequent runs)"
 ( cd "$TREE" && make -j"$jobs" )
 
@@ -109,18 +102,6 @@ outdir="$OUTBASE/${profile}-${flavor}-${stamp}"
 mkdir -p "$outdir"
 imgs=$(cd "$TREE" && ls bin/targets/*/*/*-squashfs-sysupgrade.bin 2>/dev/null || true)
 [ -n "$imgs" ] || { echo "no sysupgrade image produced — check the build log" >&2; exit 1; }
-# Guard: every collected image must belong to a device the seed actually selected.
-# A mismatch means a stale or cross-profile artifact is about to be shipped.
-want=$(grep -oP '^CONFIG_TARGET_.*_DEVICE_\K[a-z0-9_.-]+(?==y)' "$TREE/.config" | sed 's/_/_/' || true)
-if [ -n "$want" ]; then
-  for f in $imgs; do
-    base=$(basename "$f"); hit=0
-    for d in $want; do case "$base" in *"${d//_/-}"*|*"$d"*) hit=1;; esac; done
-    [ "$hit" = 1 ] || { echo "ERROR: collected image '$base' is not a device this seed selected:" >&2
-                        echo "$want" | sed 's/^/         want: /' >&2
-                        echo "  A stale or cross-profile artifact was about to be shipped. Aborting." >&2; exit 1; }
-  done
-fi
 for f in $imgs; do cp "$TREE/$f" "$outdir/"; done
 ( cd "$outdir" && sha256sum ./*.bin > SHA256SUMS )
 echo "==> DONE"
