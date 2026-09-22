@@ -14,9 +14,10 @@ role is applied as configuration *after* flashing, not baked in. It is the S twi
   (`kmod-mt7915e kmod-mt7981-firmware mt7981-wo-firmware`).
 - **New-flash units need a new tree.** Units built from 2025 week 43 onward carry the ESMT
   F50L1G41LC SPI-NAND, which OpenWrt supports from 24.10.5. Any current `main` qualifies.
-- **LEDs are not fully wired upstream.** Upstream gives `led-internet` no default trigger, so
-  that lamp stays dark out of the box. Cudy's own device tree has no GPIO for the panel's WAN
-  and LAN lamps, so they are presumably switch-port LEDs. To be confirmed on the first unit.
+- **LEDs:** the five GPIO LEDs are System, Internet, WPS, 2.4G and 5G. The panel's WAN and
+  LAN1–4 lamps are MT7531 switch LEDs that light on link in hardware, with no OpenWrt config
+  (confirmed on the first unit, 2026-09-22). **Upstream gives the Internet lamp
+  (`white:wan-online`) no trigger, so it stays dark; this profile fixes that** (below).
 
 ## What the image carries
 
@@ -29,11 +30,16 @@ The same as `wr3000h-base`; its README explains the reasons behind each choice.
 | Time | UTC |
 | Logging | syslog to `172.22.88.15` udp/514 |
 | LuCI | present; kept off WAN/transit by the **firewall zone**, not by a pinned address |
+| Internet lamp | follows the WAN port's link (`netdev` trigger on `wan`, mode `link`); **S-only** |
 
 ## Overlays
 
-- **Public** (`files/`): a **copy** of `wr3000h-base/files/`, byte-identical when this profile
-  was created. **Change both profiles together.** They are copies rather than `common/files/`
+- **Public** (`files/`): `99-homelab-base` and the sshd drop-in are **copies** of
+  `wr3000h-base/files/`, byte-identical when this profile was created. **Change both profiles
+  together.** One file is **S-only**: `98-homelab-internet-led` adds the Internet-lamp trigger.
+  It steps aside if anything already drives that LED. That covers the upstream board.d line
+  proposed for the S (the same line the H and P already have), so once it merges, the script
+  does nothing and can be deleted. They are copies rather than `common/files/`
   because the mule and GL.iNet profiles do not ship OpenSSH, and moving dropbear to :2222 on
   those images would lock them out.
 - **Private** (`$OPENWRT_PRIVATE/wr3000s-base/files/`): the same fleet-wide base keys

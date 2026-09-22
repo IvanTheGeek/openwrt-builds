@@ -1,0 +1,24 @@
+#!/bin/sh
+# WR3000S: make the front-panel "Internet" lamp (white:wan-online, GPIO 11) follow the WAN
+# port's link. Upstream OpenWrt has no board.d LED entry for the WR3000S, so the lamp is
+# always dark. The same netdev trigger the WR3000H and WR3000P get from board.d; tested on
+# a WR3000S 2026-09-22.
+#
+# Steps aside when anything already drives this LED. That covers an upstream board.d entry
+# (config_generate writes system.led_internet in preinit, before uci-defaults run) and a
+# setting made by hand. So once the upstream fix merges, this script simply does nothing.
+if uci -q show system | grep -q "\.sysfs='white:wan-online'"; then
+	logger -t homelab-base "Internet LED: already configured (board default or user), left alone"
+	exit 0
+fi
+uci -q batch <<'UCI'
+set system.led_internet=led
+set system.led_internet.name='internet'
+set system.led_internet.sysfs='white:wan-online'
+set system.led_internet.trigger='netdev'
+set system.led_internet.dev='wan'
+add_list system.led_internet.mode='link'
+commit system
+UCI
+logger -t homelab-base "Internet LED: added netdev trigger on wan (no board default)"
+exit 0
