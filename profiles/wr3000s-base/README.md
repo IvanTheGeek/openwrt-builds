@@ -39,9 +39,15 @@ The same as `wr3000h-base`; its README explains the reasons behind each choice.
   together.** One file is **S-only**: `98-homelab-internet-led` adds the Internet-lamp trigger.
   It steps aside if anything already drives that LED. That covers the upstream board.d line
   proposed for the S (the same line the H and P already have), so once it merges, the script
-  does nothing and can be deleted. They are copies rather than `common/files/`
-  because the mule and GL.iNet profiles do not ship OpenSSH, and moving dropbear to :2222 on
-  those images would lock them out.
+  does nothing and can be deleted. When it does add the LED, it writes exactly what
+  `config_generate` writes from board.d, so the resulting config is identical either way
+  (verified on a unit, 2026-09-22: same `uci export system` md5).
+  The shared files are copies rather than `common/files/` because the mule and GL.iNet
+  profiles do not ship OpenSSH, and moving dropbear to :2222 on those images would lock them
+  out.
+- ⚠️ **uci-defaults cannot use `logger`.** They run in `S10boot`, before `S12log` starts logd, so
+  a first boot's `logger` output is lost. `98-homelab-internet-led` writes to `/dev/kmsg`
+  instead, which the ring buffer keeps and `logread`/`dmesg` show.
 - **Private** (`$OPENWRT_PRIVATE/wr3000s-base/files/`): the same fleet-wide base keys
   (`openwrt-base-openssh-20260908`, `openwrt-base-breakglass-20260908`) and base root password
   as `wr3000h-base`, replaced by per-unit keys at commissioning.
