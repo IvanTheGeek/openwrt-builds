@@ -1,8 +1,8 @@
 # Profile: wr3000h-base
 
 The estate's **base image for the Cudy WR3000H v1**. One image, flashed to any unit; the
-role (206-side bridge AP, or 212-side primary router) is applied as configuration *after*
-flashing, not baked in.
+role (bridge AP or primary router) is applied as configuration *after* flashing, not baked
+in.
 
 - **Target:** mediatek / filogic, device `cudy_wr3000h-v1` (board code **R63** — the
   WR3000P is R57, and the two Cudy intermediates are both exactly 14,945,872 bytes and
@@ -19,7 +19,7 @@ flashing, not baked in.
 | SSH | **OpenSSH on :22** (key-only) + **dropbear on :2222** (key-only break-glass) |
 | Root password | set from the private overlay — **must be changed at commissioning** |
 | Time | UTC (whole estate since 2026-07-29) |
-| Logging | syslog → `172.22.88.15` udp/514 |
+| Logging | syslog → the estate's central collector, udp/514; the address is set in the private overlay |
 | LuCI | present; kept off WAN/transit by the **firewall zone**, not by a pinned address |
 | Mail | none — the estate relay is a Debian/systemd path and cannot run here |
 
@@ -30,7 +30,6 @@ which writes `!` to `/etc/shadow`) makes OpenSSH's `allowed_user()` treat the ac
 disabled and refuse **all** authentication — including public key. A real password plus
 `PasswordAuthentication no` + `PermitEmptyPasswords no` + `AuthenticationMethods publickey`
 is the supported way to be key-only here.
-See `homelab-docs/openwrt-dropbear-to-openssh-cutover.md` lines 11-18.
 
 ### Why LuCI is firewalled rather than address-bound
 
@@ -42,13 +41,14 @@ It is kept off those interfaces by **fw4 zone policy** (`wan` zone `input REJECT
 pinning `listen_http`. An earlier draft of this profile pinned it to `192.168.1.1`, which
 would have silently stranded LuCI the moment the LAN was renumbered off the OpenWrt default.
 **Whoever gives one of these boxes a transit or WAN interface must place it in a zone with
-`input REJECT`** — see `homelab-docs/agent-memory/openwrt-bridge-needs-fw4-zone.md`.
+`input REJECT`**.
 
 ## Overlays
 
 - **Public** (`files/`): `99-homelab-base` uci-defaults + the sshd hardening drop-in. No secrets.
-- **Private** (`$OPENWRT_PRIVATE/wr3000h-base/files/`): the two base public keys, and
-  `90-homelab-rootpw` which sets the base root password hash. Forgejo only, never GitHub.
+- **Private** (`$OPENWRT_PRIVATE/wr3000h-base/files/`): the two base public keys,
+  `90-homelab-rootpw` which sets the base root password hash, and `99-homelab-syslog` which
+  points syslog at the estate's collector. Forgejo only, never GitHub.
 
 Base keys (public halves live in the private overlay; private halves on the laptop):
 

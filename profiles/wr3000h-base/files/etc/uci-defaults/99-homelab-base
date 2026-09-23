@@ -1,14 +1,12 @@
 #!/bin/sh
 # Estate baseline, applied once at first boot.
 #   UTC everywhere (whole estate is UTC since 2026-07-29)
-#   syslog -> central collector 172.22.88.15
 #   dropbear demoted to :2222, key-only  (OpenSSH owns :22)
-# Roles (206 bridge AP / 212 primary router) are applied AFTER flashing, not here.
+# Remote syslog is NOT set here. The collector's address is estate-specific, so the private
+# overlay sets it, in its own uci-defaults script.
+# Roles (bridge AP / primary router) are applied AFTER flashing, not here.
 uci -q set system.@system[0].timezone='UTC'
 uci -q set system.@system[0].zonename='UTC'
-uci -q set system.@system[0].log_ip='172.22.88.15'
-uci -q set system.@system[0].log_proto='udp'
-uci -q set system.@system[0].log_port='514'
 uci -q commit system
 
 uci -q set dropbear.@dropbear[0].Port='2222'
@@ -21,7 +19,6 @@ uci -q commit dropbear
 # side by the FIREWALL (fw4 'wan' zone input REJECT), NOT by binding to a fixed address:
 # an earlier draft pinned listen_http to 192.168.1.1, which would have silently stranded
 # LuCI the moment the LAN was renumbered off the OpenWrt default. Whoever gives this box a
-# transit/WAN interface must put it in a zone with input REJECT — see
-# homelab-docs/agent-memory/openwrt-bridge-needs-fw4-zone.md.
+# transit/WAN interface must put it in a zone with input REJECT.
 /etc/init.d/sshd enable 2>/dev/null || true
 exit 0

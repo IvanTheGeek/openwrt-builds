@@ -28,7 +28,7 @@ The same as `wr3000h-base`; its README explains the reasons behind each choice.
 | SSH | **OpenSSH on :22** (key-only) + **dropbear on :2222** (key-only break-glass) |
 | Root password | set from the private overlay; **must be changed at commissioning** |
 | Time | UTC |
-| Logging | syslog to `172.22.88.15` udp/514 |
+| Logging | syslog to the estate's central collector, udp/514; the address is set in the private overlay |
 | LuCI | present; kept off WAN/transit by the **firewall zone**, not by a pinned address |
 | Internet lamp | follows the WAN port's link (`netdev` trigger on `wan`, mode `link`); **S-only** |
 
@@ -49,8 +49,9 @@ The same as `wr3000h-base`; its README explains the reasons behind each choice.
   a first boot's `logger` output is lost. `98-homelab-internet-led` writes to `/dev/kmsg`
   instead, which the ring buffer keeps and `logread`/`dmesg` show.
 - **Private** (`$OPENWRT_PRIVATE/wr3000s-base/files/`): the same fleet-wide base keys
-  (`openwrt-base-openssh-20260908`, `openwrt-base-breakglass-20260908`) and base root password
-  as `wr3000h-base`, replaced by per-unit keys at commissioning.
+  (`openwrt-base-openssh-20260908`, `openwrt-base-breakglass-20260908`), base root password
+  and `99-homelab-syslog` as `wr3000h-base`. The keys are replaced by per-unit keys at
+  commissioning.
 
 ## Build
 
