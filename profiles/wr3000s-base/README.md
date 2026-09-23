@@ -4,6 +4,10 @@ The estate's **base image for the Cudy WR3000S v1**. One image, flashed to any u
 role is applied as configuration *after* flashing, not baked in. It is the S twin of
 [`wr3000h-base`](../wr3000h-base/README.md) and carries the same baseline.
 
+- **Sibling profile:** [`wr3000s-ubootmod-base`](../wr3000s-ubootmod-base/README.md) builds the
+  same software for units converted to OpenWrt's own U-Boot layout. It reuses this profile's
+  overlays (`overlay-from`), and `build.sh` refuses to build it if the two seeds' package lists
+  differ, so **a package change here must be made in both seeds.**
 - **Target:** mediatek / filogic, device `cudy_wr3000s-v1` (OEM flash layout). Cudy's board
   code is **R59**. The H is R63 and the P is R57, and Cudy's three intermediate images are all
   exactly 14,945,872 bytes with filenames that differ by one letter. Verify by MD5, never by
