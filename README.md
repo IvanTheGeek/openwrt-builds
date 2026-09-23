@@ -33,10 +33,35 @@ Git worktrees of `openwrt/openwrt`, sharing one object store:
 | `~/openwrt` | `build/homelab` | `upstream/main` + my not-yet-merged patches (e.g. the WR3000P WAN-LED fix). Builds **homelab** flavor. |
 | `~/openwrt-mainline` | `main` | pristine `upstream/main`. Builds **mainline** flavor for comparison/testing. |
 | `~/openwrt-2512` | a topic branch on `openwrt-25.12` | a release-branch tree, used through `OPENWRT_HOMELAB` (below). |
+| `~/openwrt-be9300` | `port/ipq53xx-be9300` | a parked port branch for the GL.iNet GL-BE9300; no feeds installed. |
+
+The same layout is written down as data in [`trees.conf`](trees.conf), which `bootstrap.sh` reads.
 
 Remotes: `upstream` = openwrt/openwrt (fetch only), `fork` = IvanTheGeek/openwrt (PR topic branches).
 `build/homelab` **self-cleans**: `sync.sh` rebases it onto upstream, so any commit that merges upstream
 silently drops out — the branch shrinks toward zero as my PRs land.
+
+## Fresh build host
+
+On a new build host (Debian 13 with the buildroot prerequisites installed), as the build user and
+never as root:
+
+```sh
+git clone https://github.com/IvanTheGeek/openwrt-builds.git ~/repos/openwrt-builds
+cd ~/repos/openwrt-builds
+./bootstrap.sh                          # trees from trees.conf, LuCI fork via a src-link feed, feeds
+./bootstrap.sh --seed-bundle <file>     # same, cloning openwrt.git from a local git bundle first
+./bootstrap.sh --pin <manifest>         # exact commits, e.g. to prove a rebuilt host matches an old one
+```
+
+`bootstrap.sh` is idempotent: a tree, clone or feeds directory that already exists is reported and
+left alone (never reset, rebased, pulled or re-checked-out), so running it on an existing host
+changes nothing. `--pin` freezes each feed with `^<sha>` in that tree's `feeds.conf`, and `sync.sh`
+then keeps them frozen until the suffixes are removed; use it for proofs, not for a normal host.
+After bootstrap: supply the private overlay (`$OPENWRT_PRIVATE`) and, if you want packages built on
+the new host to verify on routers flashed from the old one, the old tree's apk signing key pair
+(`private-key.pem`, `public-key.pem` in each tree root; git-ignored, never in this repo). Then the
+normal loop is `./sync.sh` and `./build.sh <profile>`.
 
 ## Build
 
