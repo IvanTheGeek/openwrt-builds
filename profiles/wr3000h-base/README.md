@@ -21,6 +21,7 @@ in.
 | Time | UTC (whole estate since 2026-07-29) |
 | Logging | syslog → the estate's central collector, udp/514; the address is set in the private overlay |
 | LuCI | present; kept off WAN/transit by the **firewall zone**, not by a pinned address |
+| Diagnostics | `iw` (per-antenna signal, station and link details) and `iperf3` (throughput); used for the per-unit Wi-Fi radio test |
 | Mail | none — the estate relay is a Debian/systemd path and cannot run here |
 
 ### Why a root password is SET rather than locked

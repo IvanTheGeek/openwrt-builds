@@ -34,6 +34,7 @@ The same as `wr3000h-base`; its README explains the reasons behind each choice.
 | Time | UTC |
 | Logging | syslog to the estate's central collector, udp/514; the address is set in the private overlay |
 | LuCI | present; kept off WAN/transit by the **firewall zone**, not by a pinned address |
+| Diagnostics | `iw` (per-antenna signal, station and link details) and `iperf3` (throughput); used for the per-unit Wi-Fi radio test |
 | Internet lamp | follows the WAN port's link (`netdev` trigger on `wan`, mode `link`); **S-only** |
 
 ## Overlays
