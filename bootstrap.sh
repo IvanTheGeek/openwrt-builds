@@ -57,11 +57,16 @@ fi
 while read -r dir branch start track _; do
   case "$dir" in ''|'#'*) continue ;; esac
   t="$HOME/$dir"
-  want="$(pin "tree:$dir" || git -C "$PRIMARY" rev-parse --verify "${start}^{commit}")"
+  # An existing tree is checked FIRST and never resolved against: on a long-lived host the remote-
+  # tracking refs can predate the start branch (the fork's topic branches, 2026-09-23), and an
+  # "exists - left as is" run must not depend on a fetch it deliberately does not make.
   if [ -e "$t/.git" ] && { [ "$t" != "$PRIMARY" ] || [ "$FRESH" = 0 ]; }; then
-    echo "== $t exists at $(git -C "$t" rev-parse --short=10 HEAD) (manifest/start: ${want:0:10}) - left as is"
+    p="$(pin "tree:$dir" || true)"
+    echo "== $t exists at $(git -C "$t" rev-parse --short=10 HEAD)${p:+ (manifest: ${p:0:10})} - left as is"
     continue
   fi
+  want="$(pin "tree:$dir" || git -C "$PRIMARY" rev-parse --verify "${start}^{commit}")" \
+    || { echo "FATAL: cannot resolve '$start' for $dir in $PRIMARY (fetch the remote, or fix trees.conf)" >&2; exit 1; }
   if [ "$t" = "$PRIMARY" ]; then
     git -C "$PRIMARY" checkout -q -b "$branch" "$want"
     mkdir -p "$PRIMARY/dl"
