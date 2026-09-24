@@ -25,13 +25,29 @@ kernel-libipsec, updown, EAP/XAUTH, load-tester, test-vectors and others; the se
 
 - `tcpdump-mini` has no ESP or ISAKMP printers. For IPsec work, swap in the full build:
   `apk del tcpdump-mini && apk add tcpdump`.
+- `devlink` is `=m` only to build `ip-full` and `tc-full` against libmnl (iproute2 enables it when
+  devlink, rdma or dcb is selected). Without it they cannot print the kernel's extended netlink
+  error messages, which matter when adding xfrm states by hand.
 - `strongswan-mod-updown` is `=m` on purpose. It only runs a script that a swanctl child names, and
   as `=y` it would pull `iptables-nft` and the x_tables kernel modules into an nftables (fw4) image.
+
+## Known build failures
+
+- **`perf` does not build on Linux 6.18.52.** OpenWrt builds it with `NO_SLANG=1`, and in that
+  configuration `tools/perf/util/hist.h` declares a stub `hist_entry__tui_annotate()` with four
+  arguments while `builtin-annotate.c` calls it with three. That is a kernel `tools/perf` defect,
+  not this profile's. Build with `IGNORE_ERRORS=m` so it cannot stop the image; every other `=m`
+  package still builds.
+- **`kmod-crypto-test` needs a buildroot fix on 6.16 and later.** Linux renamed tcrypt's symbol
+  from `CONFIG_CRYPTO_TEST` to `CONFIG_CRYPTO_BENCHMARK`, and OpenWrt's package still names only the
+  old one, so it builds an empty package. The buildroot this profile is built from adds
+  `CONFIG_CRYPTO_BENCHMARK` to that package's `KCONFIG`.
 
 ## Differences from the base image beyond the added packages
 
 - **Kernel:** `CONFIG_KERNEL_PERF_EVENTS=y` (perf events plus the ARM PMU drivers), because `perf`
-  cannot be selected without it. The added modules also change the kernel's module hash, so
+  cannot be selected without it. It stays on while perf fails to build: `perf` does not depend on
+  the kernel hash, so a fixed perf package can be added later without reflashing. The added modules also change the kernel's module hash, so
   packages from this build and from `wr3000s-base` builds do **not** mix.
 - **bridger** starts at boot when installed and offloads bridged flows. Stop it
   (`service bridger stop`) to measure without it.
@@ -52,8 +68,11 @@ A buildroot with a host LLVM for BPF (`bridger`); the seed points at `/usr/lib/l
 
 ```sh
 ls -l "${OPENWRT_PRIVATE:-$HOME/repos/openwrt-private}/wr3000s-bench"   # must point at wr3000s-base
-OPENWRT_HOMELAB=~/openwrt-bench-main ./build.sh wr3000s-bench
+IGNORE_ERRORS=m OPENWRT_HOMELAB=~/openwrt-bench-main ./build.sh wr3000s-bench
 ```
+
+`IGNORE_ERRORS=m` ignores failures only in source packages whose every selected package is `=m`
+(perf, today). A failure in anything that reaches the image still stops the build.
 
 `build.sh` collects the sysupgrade image only. The `=m` packages are in the buildroot's
 `bin/packages/` and `bin/targets/mediatek/filogic/packages/`, signed with that buildroot's apk key.

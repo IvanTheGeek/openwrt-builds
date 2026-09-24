@@ -135,3 +135,5 @@ CONFIG_PACKAGE_strongswan-mod-resolve=m
 CONFIG_PACKAGE_strongswan-mod-unity=m
 # updown only runs scripts a swanctl child names; =y would pull iptables-nft + x_tables modules into an fw4 (nftables) image
 CONFIG_PACKAGE_strongswan-mod-updown=m
+# devlink is not wanted itself: selecting it makes iproute2 build ip-full/tc-full with libmnl (extended netlink errors)
+CONFIG_PACKAGE_devlink=m
