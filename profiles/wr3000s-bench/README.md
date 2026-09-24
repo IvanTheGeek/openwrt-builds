@@ -23,8 +23,10 @@ install later with `apk add`, without reflashing: `openvpn-mbedtls`, `kmod-crypt
 `perf`, full `tcpdump`, `miniupnpc`, and the remaining strongSwan tools and plugins (pki, charon-cmd,
 kernel-libipsec, updown, EAP/XAUTH, load-tester, test-vectors and others; the seed lists them).
 
-- `tcpdump-mini` has no ESP or ISAKMP printers. For IPsec work, swap in the full build:
-  `apk del tcpdump-mini && apk add tcpdump`.
+- `tcpdump-mini` has no ESP or ISAKMP printers. For IPsec work, swap in the full build with
+  `apk add tcpdump '!tcpdump-mini'`. A plain `apk add tcpdump` does nothing, because
+  `tcpdump-mini` already provides `tcpdump`.
+- To test OpenVPN on mbedTLS instead: `apk add openvpn-mbedtls '!openvpn-openssl'`.
 - `devlink` is `=m` only to build `ip-full` and `tc-full` against libmnl (iproute2 enables it when
   devlink, rdma or dcb is selected). Without it they cannot print the kernel's extended netlink
   error messages, which matter when adding xfrm states by hand.
