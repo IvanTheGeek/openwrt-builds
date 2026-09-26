@@ -37,12 +37,16 @@ CONFIG_PACKAGE_openssh-keygen=y
 CONFIG_PACKAGE_iw=y
 CONFIG_PACKAGE_iperf3=y
 # Fuller tools beside BusyBox (owner, 2026-09-26): targeted packages, not the whole of coreutils,
-# because some OpenWrt scripts rely on BusyBox-only options of core commands (e.g. date -D).
+# because some OpenWrt scripts rely on BusyBox-only options of core commands (e.g. date -D). shadow-utils with
+# shadow-all OFF: only chpasswd, not shadow's login/su/passwd. The procps-ng applets need the parent selected.
 CONFIG_PACKAGE_coreutils-base64=y
+CONFIG_PACKAGE_shadow-utils=y
+# CONFIG_shadow-all is not set
 CONFIG_PACKAGE_shadow-chpasswd=y
 CONFIG_PACKAGE_ip-full=y
 CONFIG_PACKAGE_sed=y
 CONFIG_PACKAGE_bash=y
+CONFIG_PACKAGE_procps-ng=y
 CONFIG_PACKAGE_procps-ng-ps=y
 CONFIG_PACKAGE_procps-ng-pkill=y
 CONFIG_PACKAGE_diffutils=y
