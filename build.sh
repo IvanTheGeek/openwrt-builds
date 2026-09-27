@@ -33,6 +33,14 @@
 # Secret placeholders: a private file may be committed as a PLACEHOLDER line carrying the marker
 # @@UNSET-SECRET@@ before its real value exists. The build refuses any overlay that still carries it.
 #
+# crashguard: when the assembled overlay carries usr/sbin/crashguard (the WR3000S base overlay does),
+# the image must also carry /etc/crashguard.conf, which holds the push topic and so comes ONLY from a
+# private layer. The build refuses: a conf in any public layer; no private conf (so --no-private and
+# public-only profiles cannot build such an image); a private conf that is not a regular file of mode
+# 600, still holds the template placeholder REPLACE-WITH-FLEET-TOPIC, has no NTFY_URL=https:// line or
+# a NOTIFY hook that is not an executable in the image; and a conf that would land group/world-readable.
+# It names files and modes, never the conf's contents.
+#
 # Collected: the sysupgrade image (*-squashfs-sysupgrade.bin or .itb) and, for devices on
 # OpenWrt's own U-Boot layout ("…-ubootmod"), the TFTP recovery image and the bootloader
 # (*-initramfs-recovery.itb, *-preloader.bin, *-bl31-uboot.fip). Every collected file must be
@@ -188,6 +196,45 @@ chmod -R go-w "$FILES"
 if [ -n "$SITED" ] && [ "$use_private" = 1 ]; then
   # (.gitkeep files were deleted from the merged tree above: skip them, or chmod fails on them)
   (cd "$SITED/files" && find . -type f ! -name .gitkeep -print0) | (cd "$FILES" && xargs -0 -r chmod go-rwx --)
+fi
+
+# Guard: crashguard's conf (see header). Names and modes only: the conf is never printed.
+if [ -e "$FILES/usr/sbin/crashguard" ]; then
+  CGC=etc/crashguard.conf
+  cg_fail(){ echo "ERROR: this image carries crashguard (usr/sbin/crashguard), but $1" >&2; shift
+             for l in "$@"; do echo "  $l" >&2; done; exit 1; }
+  cg_pub=""
+  for d in "$REPO_DIR/common/files" ${BASEP:+"$BPROF/files"} "$PROF/files"; do
+    if [ -e "$d/$CGC" ] || [ -L "$d/$CGC" ]; then cg_pub="$cg_pub $d/$CGC"; fi
+  done
+  [ -z "$cg_pub" ] || cg_fail "a PUBLIC overlay holds $CGC:$cg_pub" \
+    "the conf holds the push topic: remove it from the public repo; it belongs in the private overlay only"
+  cg_src=""
+  if [ "$use_private" = 1 ]; then
+    for d in ${BASEP:+"$PRIVATE/$BASEP/files"} "$PRIVATE/$profile/files" ${SITED:+"$SITED/files"}; do
+      if [ -e "$d/$CGC" ] || [ -L "$d/$CGC" ]; then cg_src="$d/$CGC"; fi
+    done
+  fi
+  [ -n "$cg_src" ] || cg_fail "no private overlay provides $CGC (without it no crash alert reaches anyone)" \
+    "put the conf in \$OPENWRT_PRIVATE/${BASEP:-$profile}/files/$CGC (mode 600), from the template crashguard.conf.example" \
+    "(--no-private, or a public-only profile, cannot build an image that carries crashguard)"
+  { [ -f "$cg_src" ] && [ ! -L "$cg_src" ]; } || cg_fail "$cg_src is not a regular file"
+  cg_mode=$(stat -c %a "$cg_src")
+  [ "$cg_mode" = 600 ] || cg_fail "$cg_src has mode $cg_mode, not 600" "chmod 600 it in the private repo, then sync it to the build host"
+  if grep -qF 'REPLACE-WITH-FLEET-TOPIC' "$cg_src"; then
+    cg_fail "$cg_src still holds the template placeholder (REPLACE-WITH-FLEET-TOPIC)" "the owner writes the real topic into it (never in chat, never in a public file)"
+  elif [ $? -ne 1 ]; then cg_fail "$cg_src could not be read"; fi
+  grep -Eq '^[[:space:]]*NTFY_URL[[:space:]]*=[[:space:]]*["'"'"']?https://' "$cg_src" ||
+    cg_fail "$cg_src has no NTFY_URL=https://... line (no push channel)"
+  cg_hook=$(sed -n 's/^[[:space:]]*NOTIFY[[:space:]]*=[[:space:]]*//p' "$cg_src" | tail -n 1 | sed 's/[[:space:]]*#.*$//; s/[[:space:]]*$//')
+  case "$cg_hook" in /*) ;; *) cg_hook="";; esac
+  { [ -n "$cg_hook" ] && [ -f "$FILES$cg_hook" ] && [ -x "$FILES$cg_hook" ]; } ||
+    cg_fail "the NOTIFY line of $cg_src does not name an executable push hook in this image" "(the template's is NOTIFY=/usr/libexec/crashguard-ntfy)"
+  cmp -s "$cg_src" "$FILES/$CGC" || cg_fail "the assembled $CGC is not the private layer's copy ($cg_src)"
+  cg_mode=$(stat -c %a "$FILES/$CGC")
+  [ $(( 8#$cg_mode & 8#077 )) = 0 ] || cg_fail "$CGC would land in the image with mode $cg_mode (group/world-readable)"
+  echo "    crashguard: $CGC from $cg_src, mode $cg_mode (contents not shown)"
+  unset cg_hook
 fi
 
 # --- configure from the seed ---

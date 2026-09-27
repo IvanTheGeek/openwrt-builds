@@ -133,6 +133,15 @@ dialog or an existing 0600 file, and `--check` tells whether it is filled in, wi
 dialog captures live in a private tmpfs directory, never in the overlay tree, and `build.sh` refuses an
 overlay that still holds one of its `.psk-*` temporary files (as it refuses `*.plain` and `*.age-key`).
 
+**crashguard's conf.** An image whose overlay carries `usr/sbin/crashguard` (the WR3000S base overlay
+does, see [`profiles/wr3000s-base`](profiles/wr3000s-base/README.md)) must also carry
+`/etc/crashguard.conf`, which holds the push topic and therefore comes **only** from a private layer.
+`build.sh` refuses the build when a public layer holds that file, when no private layer provides it
+(so `--no-private` cannot build such an image), when the private copy is not a regular file of mode
+`600`, still holds the template placeholder `REPLACE-WITH-FLEET-TOPIC`, has no `NTFY_URL=https://`
+line or a `NOTIFY` hook that is not an executable in the image, and when it would land
+group/world-readable. It names files and modes, never the conf's contents.
+
 **Rule:** an image built with the private overlay is itself secret-bearing. Never publish its
 sysupgrade image (`.bin` or `.itb`) or its `initramfs-recovery.itb`: all of them carry the overlay.
 (A U-Boot-layout build's `preloader.bin` and `bl31-uboot.fip` carry none.) Only `--mainline` /
