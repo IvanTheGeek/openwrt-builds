@@ -69,6 +69,7 @@ normal loop is `./sync.sh` and `./build.sh <profile>`.
 ./build.sh wr3000p-mule              # homelab flavor: my patches + overlays (incl. private)
 ./build.sh wr3000p-mule --mainline   # pristine upstream, seed only, NO overlays at all (A/B comparison)
 ./build.sh neighbornet-node          # public-only profile: private overlay refused even if present
+./build.sh <profile> --site <name>   # plus ONE private site layer, merged last (see Site layers)
 ```
 Images land in `~/builds/<profile>-<flavor>-<shorthash>/` (`homelab-noprivate` when the private overlay
 was skipped) with `SHA256SUMS`, one fresh directory per build: an existing one is renamed
@@ -105,6 +106,32 @@ A profile whose `overlay-from` file contains `<base>` gets `<base>`'s layers fir
 - The private overlay is applied **only** to homelab-flavor builds of profiles that are *not*
   marked `public-only`. `--mainline` (which applies no overlay at all), `--no-private`, the
   `public-only` marker, and an `overlay-from` base marked `public-only` each force it off.
+
+### Site layers
+
+Some units share configuration because of *where* they are, not what they are: a location's Wi-Fi
+passphrase, and the role each unit plays there. That lives in a **site layer** in the private repo,
+never here, so nothing public names a site:
+
+```
+$OPENWRT_PRIVATE/sites/<name>/profiles   # the profiles this site layer may be built into, one per line
+$OPENWRT_PRIVATE/sites/<name>/files/     # merged LAST, after every profile layer
+```
+
+`./build.sh <profile> --site <name>` refuses when no private overlay applies (`--mainline`,
+`--no-private`, `public-only`) and when `profiles` does not list the profile. Every file that came
+from the site layer is made owner-only in the image (git cannot carry `0600`). The output directory
+is labelled `homelab-site<name>`. A site layer's role scripts pick a unit's role from its own
+identity at first boot, so one image serves every unit of the site and the profiles stay
+role-agnostic. Every site image is secret-bearing, like any homelab image.
+
+**Secret placeholders.** A private file may be committed as a single PLACEHOLDER line carrying the
+marker `@@UNSET-SECRET@@`, so that the layout is in git before the value exists. `build.sh` refuses
+any overlay that still carries the marker (it prints the file names, never contents).
+[`tools/set-site-psk.sh`](tools/set-site-psk.sh) writes a site's Wi-Fi passphrase file from a desktop
+dialog or an existing 0600 file, and `--check` tells whether it is filled in, without showing it. Its
+dialog captures live in a private tmpfs directory, never in the overlay tree, and `build.sh` refuses an
+overlay that still holds one of its `.psk-*` temporary files (as it refuses `*.plain` and `*.age-key`).
 
 **Rule:** an image built with the private overlay is itself secret-bearing. Never publish its
 sysupgrade image (`.bin` or `.itb`) or its `initramfs-recovery.itb`: all of them carry the overlay.

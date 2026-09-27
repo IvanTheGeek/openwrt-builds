@@ -1,7 +1,7 @@
 #!/bin/bash
 # build.sh — build one profile's OpenWrt image.
 #
-#   ./build.sh <profile> [--mainline] [--no-private] [-j N]
+#   ./build.sh <profile> [--mainline] [--no-private] [--site <name>] [-j N]
 #
 # Flavors:
 #   (default)     build/homelab worktree  (~/openwrt)          = upstream + our patches, WITH overlays
@@ -23,6 +23,16 @@
 #   common/ → <base>/files/ → <p>/files/ → $PRIVATE/<base>/files/ → $PRIVATE/<p>/files/
 # The two seeds must be identical apart from CONFIG_TARGET_* lines; the build refuses otherwise.
 #
+# --site <name>: merge ONE site layer, $OPENWRT_PRIVATE/sites/<name>/files/, LAST (after every
+# profile layer). A site layer is private by definition: it carries what one location's units share
+# (e.g. the Wi-Fi passphrase) and their role scripts, and nothing public ever names a site. The
+# build refuses a site layer when no private overlay applies (--mainline, --no-private,
+# public-only), and unless sites/<name>/profiles lists this profile, one name per line. The output
+# directory is labelled "<flavor>-site<name>", so a site image cannot be mistaken for a base one.
+#
+# Secret placeholders: a private file may be committed as a PLACEHOLDER line carrying the marker
+# @@UNSET-SECRET@@ before its real value exists. The build refuses any overlay that still carries it.
+#
 # Collected: the sysupgrade image (*-squashfs-sysupgrade.bin or .itb) and, for devices on
 # OpenWrt's own U-Boot layout ("…-ubootmod"), the TFTP recovery image and the bootloader
 # (*-initramfs-recovery.itb, *-preloader.bin, *-bl31-uboot.fip). Every collected file must be
@@ -35,16 +45,19 @@ MAINLINE="${OPENWRT_MAINLINE:-$HOME/openwrt-mainline}"
 PRIVATE="${OPENWRT_PRIVATE:-$HOME/repos/openwrt-private}"
 OUTBASE="${OPENWRT_BUILDS_OUT:-$HOME/builds}"
 
-profile=""; mainline=0; no_private=0; jobs="$(nproc)"
+profile=""; mainline=0; no_private=0; site=""; site_given=0; jobs="$(nproc)"
 while [ $# -gt 0 ]; do case "$1" in
   --mainline) mainline=1;;
   --no-private) no_private=1;;
+  --site) [ $# -ge 2 ] || { echo "--site needs a site name" >&2; exit 2; }
+          case "$2" in ''|*/*|.*|-*) echo "--site needs a bare name, got '$2'" >&2; exit 2;; esac
+          shift; site="$1"; site_given=1;;
   -j) shift; jobs="$1";;
   -*) echo "unknown flag: $1" >&2; exit 2;;
   *) profile="$1";;
 esac; shift; done
 
-[ -n "$profile" ] || { echo "usage: $0 <profile> [--mainline] [--no-private] [-j N]"; echo "profiles:"; ls "$REPO_DIR/profiles"; exit 2; }
+[ -n "$profile" ] || { echo "usage: $0 <profile> [--mainline] [--no-private] [--site <name>] [-j N]"; echo "profiles:"; ls "$REPO_DIR/profiles"; exit 2; }
 PROF="$REPO_DIR/profiles/$profile"
 [ -d "$PROF" ] || { echo "no such profile: $profile (see $REPO_DIR/profiles/)" >&2; exit 2; }
 [ -f "$PROF/seed" ] || { echo "profile '$profile' has no seed file" >&2; exit 2; }
@@ -112,6 +125,17 @@ use_private=1
 [ "$no_private" = 1 ] && use_private=0
 [ -e "$PROF/public-only" ] && { use_private=0; echo "    ! profile is public-only: private overlay SKIPPED"; }
 [ -n "$BASEP" ] && [ -e "$BPROF/public-only" ] && { use_private=0; echo "    ! overlay-from '$BASEP' is public-only: private overlay SKIPPED"; }
+# --- site layer (see header): validated before anything is assembled ---
+SITED=""
+if [ "$site_given" = 1 ]; then
+  case "$site" in ''|*/*|.*|-*) echo "--site needs a bare name, got '$site'" >&2; exit 2;; esac
+  [ "$mainline" = 0 ] || { echo "--site: a --mainline build carries no overlay, so it cannot carry a site layer" >&2; exit 2; }
+  [ "$use_private" = 1 ] || { echo "--site: site layers are private, and this build applies no private overlay" >&2; exit 2; }
+  SITED="$PRIVATE/sites/$site"
+  [ -d "$SITED/files" ] || { echo "--site: no site layer at $SITED/files" >&2; exit 2; }
+  { [ -f "$SITED/profiles" ] && grep -qxF "$profile" "$SITED/profiles"; } ||
+    { echo "--site: $SITED/profiles does not list '$profile'" >&2; exit 2; }
+fi
 if [ "$mainline" = 1 ]; then
   use_private=0
   echo "==> --mainline: no overlays (pure upstream)"
@@ -126,18 +150,45 @@ else
       if [ -d "$PRIVATE/$pp/files" ]; then merge "$PRIVATE/$pp/files"; found=1; fi
     done
     [ "$found" = 1 ] || echo "    (no private overlay at $PRIVATE/${BASEP:+$BASEP|}$profile/files — building without secrets)"
+    [ -n "$SITED" ] && { echo "    (site: $site)"; merge "$SITED/files"; }
   else
     echo "    ⚠️  no private overlay: any public hardening (e.g. key-only SSH) ships WITHOUT the keys"
   fi
 fi
 # strip .gitkeep placeholders so they don't land in the rootfs
 find "$FILES" -name .gitkeep -delete 2>/dev/null || true
+# Guard: openwrt-private's .gitignore keeps *.plain and *.age-key out of git, but the rsync to the
+# build host copies them anyway. An image carrying one would depend on data no repo holds (so it
+# could never be rebuilt), and would ship a file meant never to leave the laptop.
+# .psk-* are the temporary files of tools/set-site-psk.sh: one left behind by a crash holds a passphrase.
+stray=$(cd "$FILES" && find . \( -name '*.plain' -o -name '*.age-key' -o -name '.psk-*' \) -print)
+[ -z "$stray" ] || { echo "ERROR: the overlay carries files git never holds:" >&2; echo "$stray" | sed 's/^/    /' >&2; exit 1; }
+# Guard: a secret nobody filled in. A private repo may ship a secret's file as a PLACEHOLDER line that
+# carries the marker below, so the layout is in git before the value is. An image built from it would
+# carry a non-working secret and look complete, so any overlay file holding the marker stops the build.
+# File names only, never contents. grep exits 0 = found, 1 = none, 2 = could not read everything.
+if unset_files=$(cd "$FILES" && grep -rlF -e '@@UNSET-SECRET@@' .); then
+  echo "ERROR: unfilled secret placeholder (marker @@UNSET-SECRET@@) in the overlay:" >&2
+  echo "$unset_files" | sed 's/^\./    /' >&2
+  echo "  write the real value into the private repo first (e.g. tools/set-site-psk.sh <site>)" >&2
+  exit 1
+elif [ $? -ne 1 ]; then
+  echo "ERROR: could not scan the overlay for secret placeholders (grep failed)" >&2
+  exit 1
+fi
 # Normalize permissions: git cannot carry directory modes, so a contributor
 # umask of 0002 bakes group-writable dirs into the rootfs — dropbear then
 # refuses ALL pubkey auth ("/etc/dropbear must be owned by user or root, and
 # not writable by group or others"), masked by blank-password auth until a
 # password is set. Strip group/other write from everything in the overlay.
 chmod -R go-w "$FILES"
+# A site layer is private data read by root at boot (role scripts, passphrases). git carries no
+# 0600, so a fresh checkout would ship a passphrase world-readable: make every file that came from
+# the site layer owner-only in the image, whatever mode the checkout gave it.
+if [ -n "$SITED" ] && [ "$use_private" = 1 ]; then
+  # (.gitkeep files were deleted from the merged tree above: skip them, or chmod fails on them)
+  (cd "$SITED/files" && find . -type f ! -name .gitkeep -print0) | (cd "$FILES" && xargs -0 -r chmod go-rwx --)
+fi
 
 # --- configure from the seed ---
 echo "==> applying seed"
@@ -201,6 +252,7 @@ esac; done
 
 stamp="$(cd "$TREE" && git rev-parse --short HEAD)"
 label="$flavor"; [ "$flavor" = homelab ] && [ "$use_private" = 0 ] && label="homelab-noprivate"
+[ -n "$SITED" ] && label="$label-site$site"
 outdir="$OUTBASE/${profile}-${label}-${stamp}"
 # A fresh directory per build, so nothing from an earlier run of the same commit sits next to
 # this run's files unlisted. An existing one is kept, renamed, never deleted.
