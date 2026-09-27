@@ -36,7 +36,7 @@ The same as `wr3000h-base`; its README explains the reasons behind each choice.
 | LuCI | present; kept off WAN/transit by the **firewall zone**, not by a pinned address |
 | Diagnostics | `iw` (per-antenna signal, station and link details) and `iperf3` (throughput); used for the per-unit Wi-Fi radio test |
 | Internet lamp | follows the WAN port's link (`netdev` trigger on `wan`, mode `link`); **S-only** |
-| Crash alert | **crashguard**: at boot (S09, before the modules load) archives a kernel crash record from pstore to flash, then alerts until someone acknowledges it (LED, syslog, ntfy push); on a unit that also runs the U-Boot crash limiter it clears the limiter's counter once the boot is stable. The image never touches the U-Boot env: the limiter is a separate, per-unit step |
+| Crash alert | **crashguard**: at boot (S09, before the modules load) archives a kernel crash record from pstore to flash, then alerts until someone acknowledges it (LED, syslog, ntfy push); on a unit that also runs the U-Boot crash limiter it clears the limiter's counter once the boot is stable. The image never installs or changes the limiter (a separate, per-unit step); on a unit that has it, crashguard only deletes the counter variables once the boot is stable. Never flash an image WITHOUT crashguard (e.g. `--mainline`) onto a unit that runs the limiter: nothing would clear its counter |
 
 ## Overlays
 
@@ -62,9 +62,12 @@ The same as `wr3000h-base`; its README explains the reasons behind each choice.
   clean, 1 needs attention, 3 cannot tell.
 - **crashguard's conf is private.** `/etc/crashguard.conf` (the ntfy topic) comes only from
   `$OPENWRT_PRIVATE/wr3000s-base/files/etc/crashguard.conf`, mode `600`; `build.sh` refuses an image
-  without it, with the template placeholder, or with a looser mode (top-level README). A
-  keep-settings sysupgrade does not keep it (`keep.d` keeps only `/etc/crashguard/`), so every image
-  brings its own and a topic change is a rebuild.
+  without it, with the template placeholder, or with a looser mode (top-level README). A default
+  keep-settings sysupgrade (no `-c`/`-o`) does not keep it (`keep.d` keeps only `/etc/crashguard/`), so
+  every image brings its own and a topic change is a rebuild. Never edit the conf on a unit: `-c`/`-o`
+  would then carry that copy forward. Accepted exposure (by design): a push passes the topic URL in
+  `uclient-fetch`'s argv (readable in `/proc` on the router during a push), and the TFTP recovery `.itb`
+  carries the conf too, like every image of this profile (never publish either).
 - ⚠️ **uci-defaults cannot use `logger`.** They run in `S10boot`, before `S12log` starts logd, so
   a first boot's `logger` output is lost. `98-homelab-internet-led` writes to `/dev/kmsg`
   instead, which the ring buffer keeps and `logread`/`dmesg` show.
