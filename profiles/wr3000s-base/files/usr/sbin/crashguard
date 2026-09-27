@@ -1,0 +1,924 @@
+#!/bin/sh
+# crashguard: archive kernel crash records (ramoops, /sys/fs/pstore) at boot, keep telling a human
+# until one acknowledges, and, on a ubootmod unit running the U-Boot crash limiter, clear the
+# limiter's counter once the unit has stayed up. POSIX sh for BusyBox ash. DRAFT v2 (round 2) 2026-09-26.
+#
+#   crashguard status [-v]      exit 0 clean | 1 needs attention | 3 cannot tell (never read 3 as clean)
+#   crashguard list | show <id> | ack <id>|all
+#   crashguard notify-test      one test push; on delivery records /etc/crashguard/push-verified
+#   crashguard push-check       exit 0 only if the push channel was verified on this unit (guard-apply.sh)
+#   crashguard export           tar of the RAM copies to stdout; marks them releasable
+#   crashguard release [--force]
+#   crashguard collect          S09 (/etc/init.d/crashguard): bounded; no network, no waits, no env
+#                               access, and it never reads /etc/crashguard.conf
+#   crashguard watch            procd instance: LED, repeated syslog alert, push hook, stable-uptime work
+#
+# Evidence model: the archive on flash (/etc/crashguard/archive) is the record. A record in
+# /sys/fs/pstore is released (deleted) only after a copy on the flash overlay has been compared
+# byte for byte and synced. A copy in RAM (/tmp) never counts as archived: without a writable
+# flash overlay (the RAM recovery), or when the flash write fails, records are HELD until someone
+# exports them ('crashguard export') or forces it ('crashguard release --force'). Files on flash are
+# never edited in place: each is written to .tmp, read back, synced and renamed, so a full overlay
+# fails loudly and HOLDS the record. Syslog is UDP and best effort, so it is repeated until someone
+# acks; nothing is ever marked "delivered" because of it. The push hook (ntfy) counts as delivered
+# only when the server confirms. Releasing records also makes U-Boot's 'pstore check' mean "the
+# previous boot crashed", which the U-Boot crash limiter (guard-apply.sh) needs.
+#
+# /etc/crashguard.conf is PARSED, never sourced: only whitelisted KEY=VALUE lines are read, numbers
+# are checked against floors, and a problem in it is reported (status exit 1, LED, alert).
+#
+# Push contract (ntfy): a NEW crash or limit is pushed at urgent priority; every crash episode ends
+# with a "stable" push once the boot has been up STABLE_S; while anything stays unacknowledged, ONE
+# summary reminder per unit follows every NOTIFY_REPEAT of uptime (default 1 day, default priority).
+# ntfy cannot report a unit that went quiet: silence without a "stable" push means still crashing or
+# backing off, or the site is offline; the optional heartbeat is the dead-man signal.
+
+R=${CG_ROOT:-}                      # empty on a router; a fake root in tests
+PSTORE=$R/sys/fs/pstore
+CG=$R/etc/crashguard                # kept by keep-config sysupgrades (keep.d); 'sysupgrade -n' wipes it
+ARCH=$CG/archive
+RUN=$R/tmp/crashguard               # this boot only
+RAM=$RUN/archive                    # copies made when the flash overlay cannot take them
+CONF=${CG_CONF:-$R/etc/crashguard.conf}
+KEEP=16 MAX_KB=512                  # archive caps (not configurable)
+STABLE_S=600                        # uptime after which the crash streak and the U-Boot counter reset
+INTERVAL=3600                       # syslog reminder period while anything needs attention
+NOTIFY_REPEAT=86400                 # summary reminder period (uptime) while anything is unacknowledged
+HEARTBEAT_S=0                       # 0 = off; else a low-priority "still alive" push this often
+LED=white:wps                       # blinks while anything needs attention; empty = no LED
+NOTIFY=                             # push hook: $NOTIFY <event> <message> <unit>; exit 0 = delivered
+NO_PUSH=                            # yes = syslog-only unit: a live guard without a push is not an alarm
+LOG_DEV=                            # if set, the first syslog alert waits for a route via this device
+TICK=${CG_TICK:-30}
+CLEAR_RETRY=${CG_CLEAR_RETRY:-3600} # retry period for a U-Boot counter clear that failed or was refused
+CONF_ERR= PUSH_HOST= NTFY_URL_V= PUSH_NEXT=0 PUSH_WAIT=0 PUSH_FAILS=0 CLEARED=
+
+# U-Boot env texts (WR3000S ubootmod; runbook T23, T26; the F1 env text, guard-apply.sh)
+STOCK_CMD='if pstore check ; then run boot_recovery ; else run boot_ubi ; fi'
+F1_CMD='if pstore check ; then run boot_recovery ; fi ; run boot_ubi'
+GUARD_A_CMD='if pstore check ; then run crash_guard ; run boot_recovery ; else run crash_unpark ; fi ; run boot_ubi'
+GUARD_B_CMD='if pstore check ; then run crash_guard ; run boot_recovery ; fi ; run boot_ubi'
+F1_LOOP='led $bootled_rec on ; while true ; do run boot_tftp ; sleep 1 ; done'
+A_GUARD='if env exists crash3 ; then run crash_limit ; else run crash_count ; fi'
+A_COUNT='if env exists crash2 ; then setenv crash3 1 ; setenv crash_park 1 ; saveenv && run crash_stop ; else if env exists crash1 ; then setenv crash2 1 ; else setenv crash1 1 ; fi ; saveenv ; fi'
+A_LIMIT='if env exists crash_park ; then setenv crash_park ; saveenv ; else setenv crash_park 1 ; saveenv && run crash_stop ; fi'
+A_STOP='run boot_tftp_forever'
+A_UNPARK='if env exists crash_park ; then setenv crash_park ; saveenv ; fi'
+B_GUARD='if env exists crash3 ; then run crash_stop ; else run crash_count ; fi'
+B_COUNT='if env exists crash2 ; then setenv crash3 1 ; saveenv ; run crash_stop ; else if env exists crash1 ; then setenv crash2 1 ; else setenv crash1 1 ; fi ; saveenv ; fi'
+B_STOP='led $bootled_rec on ; sleep 3600 ; led $bootled_rec off'
+COUNTER='crash1 crash2 crash3 crash_park'
+
+# What a person at the unit must do. Record decay is unit-dependent: on one bench unit a record was gone
+# after ~2 s unpowered, but another kept part of a record through a 10 s cut at its DC plug and then sat
+# hung in U-Boot for 8 h; a 60 s cut recovered it. Hence 60, not 10. Holding Reset loads and saves the stock
+# env, which re-arms the crash trap (T22, T23).
+FIELD="If the network is down: unplug the router, count to 60, plug it back in. NEVER hold the Reset button: a crash record may still be in memory, and Reset brings back the crash trap."
+
+kmsg() { echo "<$1>crashguard: $2" 2>/dev/null >> "$R/dev/kmsg"; }
+slog() { logger -t crashguard -p "daemon.$1" -- "$2"; }
+num() { case $1 in ''|*[!0-9]*) echo 0 ;; *) n_=${1#"${1%%[!0]*}"}; echo "${n_:-0}" ;; esac; }
+up_s() { u=; { read -r u _ < "$R/proc/uptime"; } 2>/dev/null; num "${u%%.*}"; }
+bootid() { cat "$R/proc/sys/kernel/random/boot_id" 2>/dev/null; }
+getv() { sed -n "s/^$1=//p" "$2" 2>/dev/null | head -n 1; }
+ev() { sed -n "s/^$1=//p" "$2" 2>/dev/null | head -n 1; }
+st() { echo "$1" >> "$RUN/state"; }
+dur() { if [ "$1" -ge 3600 ]; then echo "$(( $1 / 3600 )) h"; else echo "$(( $1 / 60 )) min"; fi; }
+pstore_mounted() { grep -q ' /sys/fs/pstore pstore ' "$R/proc/mounts"; }
+held() { set -- "$PSTORE"/*; [ -e "$1" ]; }
+on_flash() { grep -qE '^[^ ]+ /overlay (ubifs|jffs2|ext4|f2fs) rw[, ]' "$R/proc/mounts"; }
+ubootmod() { case "$(cat "$R/tmp/sysinfo/board_name" 2>/dev/null)" in *-ubootmod) return 0 ;; esac; return 1; }
+streak() { num "$(cat "$CG/streak" 2>/dev/null)"; }
+unit_id() {
+	u=$(jsonfilter -i "$R/etc/board.json" -e '@.system.label_macaddr' 2>/dev/null)
+	[ -n "$u" ] || u=$(cat "$R/sys/class/net/eth0/address" 2>/dev/null)   # WR3000S: eth0 = label MAC
+	echo "${u:-unknown}" | tr -d ':'
+}
+pending() { for p in "$ARCH"/*/ "$RAM"/*/; do [ -f "${p}info" ] && [ ! -e "${p}acked" ] && echo "${p%/}"; done; }
+guard() { case $ENV_CLASS in GUARD-A|GUARD-B) return 0 ;; esac; return 1; }
+
+# put <file> <text>: write <file>.tmp, read it back, sync, rename. Never truncates the live file,
+# and never trusts an exit code alone (BusyBox 'sed -i' returns 0 on a full overlay and empties the file).
+# '2>/dev/null' comes BEFORE '>': redirections apply left to right, so a read-only overlay's "can't
+# create" message is silenced too (put's exit status is what callers act on).
+put() {
+	[ -d "$1" ] && return 1                     # mv would move the .tmp INTO a directory and "succeed"
+	printf '%s\n' "$2" 2>/dev/null > "$1.tmp" && [ "$(cat "$1.tmp" 2>/dev/null)" = "$2" ] && sync && mv -f "$1.tmp" "$1" 2>/dev/null && return 0
+	rm -f "$1.tmp" 2>/dev/null; return 1
+}
+
+# ---- /etc/crashguard.conf: parsed, never sourced ------------------------------------------
+cerr() { CONF_ERR="$CONF_ERR${CONF_ERR:+; }$1"; }
+url_ok() { printf '%s\n' "$1" | grep -qE '^https://[A-Za-z0-9.-]+(:[0-9]+)?(/[A-Za-z0-9_.-]+)+$'; }
+conf_load() {
+	CONF_ERR= PUSH_HOST= NTFY_URL_V=
+	[ -e "$CONF" ] || return 0
+	[ -r "$CONF" ] || { cerr "cannot read the conf"; return 0; }
+	c_=$(tr -d '\r' < "$CONF")
+	while IFS= read -r l; do
+		l=$(printf '%s' "$l" | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')
+		case $l in ''|'#'*) continue ;; esac
+		case $l in *=*) ;; *) cerr "ignored a line that is not KEY=VALUE"; continue ;; esac
+		k=$(printf '%s' "${l%%=*}" | sed 's/[[:space:]]*$//') v=${l#*=}
+		case $k in ''|*[!A-Z0-9_]*) cerr "ignored a line that is not KEY=VALUE"; continue ;; esac
+		v=$(printf '%s' "$v" | sed 's/[[:space:]][[:space:]]*#.*$//; s/^[[:space:]]*//; s/[[:space:]]*$//')
+		case $v in \"*\") v=${v#\"}; v=${v%\"} ;; \'*\') v=${v#\'}; v=${v%\'} ;; esac
+		case $k in
+		NOTIFY)
+			case $v in
+			'') NOTIFY= ;;
+			*..*|*[!A-Za-z0-9/._-]*) cerr "NOTIFY is not a plain absolute path: push disabled"; NOTIFY= ;;
+			/*) NOTIFY=$v ;;
+			*) cerr "NOTIFY is not an absolute path: push disabled"; NOTIFY= ;;
+			esac ;;
+		NTFY_URL)                                   # the topic is a secret: never echo the value
+			case $v in *REPLACE-WITH*) cerr "NTFY_URL still holds the template placeholder"; continue ;; esac
+			if url_ok "$v"; then h_=${v#https://}; h_=${h_%%/*}; PUSH_HOST=${h_%%:*} NTFY_URL_V=$v
+			else cerr "NTFY_URL is not https://<host>/<topic> (value not shown)"; fi ;;
+		LED)
+			case $v in *[!A-Za-z0-9:_-]*) cerr "LED is not a LED name; kept $LED" ;; *) LED=$v ;; esac ;;
+		LOG_DEV)
+			case $v in *[!A-Za-z0-9._-]*) cerr "LOG_DEV is not an interface name; ignored" ;; *) LOG_DEV=$v ;; esac ;;
+		NO_PUSH)
+			case $v in yes|no|'') NO_PUSH=$v ;; *) cerr "NO_PUSH is not yes or no; ignored" ;; esac ;;
+		STABLE_S|INTERVAL|NOTIFY_REPEAT|HEARTBEAT_S)
+			case $k in
+			STABLE_S) lo=120 hi=86400 ;; INTERVAL) lo=300 hi=86400 ;;
+			NOTIFY_REPEAT) lo=600 hi=604800 ;; HEARTBEAT_S) lo=3600 hi=604800 ;;
+			esac
+			case $v in ''|*[!0-9]*) cerr "$k is not a whole number of seconds (default kept)"; continue ;; esac
+			v=$(num "$v")
+			[ "$k" = HEARTBEAT_S ] && [ "$v" = 0 ] && { HEARTBEAT_S=0; continue; }
+			if [ "${#v}" -gt 7 ] || [ "$v" -lt "$lo" ] || [ "$v" -gt "$hi" ]; then
+				cerr "$k is outside $lo..$hi (default kept)"; continue; fi
+			eval "$k=\$v" ;;                        # $k is one of the four names above
+		*) cerr "unknown key $k ignored" ;;
+		esac
+	done <<EOF
+$c_
+EOF
+	if [ -n "$NOTIFY" ] && [ ! -x "$NOTIFY" ]; then cerr "NOTIFY is not an executable file: push disabled"; NOTIFY=; fi
+	case $NOTIFY in */crashguard-ntfy) [ -n "$PUSH_HOST" ] || { cerr "NOTIFY is the ntfy hook but NTFY_URL is missing or invalid: push disabled"; NOTIFY=; } ;; esac
+	return 0
+}
+
+# One line: why, panic line, first error line, pc, comm, uptime at the crash. Second line: the
+# signature used to spot a loop (the same without the uptime and the record sizes, cut after).
+summary_of() {
+	for f; do
+		case "$f" in *.enc.z) echo "@@ENC ${f##*/} $(wc -c < "$f")" ;; *) cat "$f"; echo ;; esac
+	done | awk '
+	/^(Panic|Oops|Emergency|Shutdown|Unknown)#[0-9]+ Part[0-9]+$/ { why = why (why ? "+" : "") $1; next }
+	/^@@ENC / { enc = enc " " $2 " (" $3 " B, undecodable)"; encn = encn " " $2; next }
+	match($0, /^<[0-9]+>\[ *[0-9]+\.[0-9]+\] /) {
+		t = substr($0, 1, RLENGTH); gsub(/^<[0-9]+>\[ *|\] $/, "", t); last = t
+		$0 = substr($0, RLENGTH + 1)
+	}
+	# Our own kmsg lines are not evidence: in a crash loop the record holds the log of the boot that
+	# crashed, which already quotes the PREVIOUS crash ("CRASH RECORD ... Kernel panic ..."), so every
+	# field below would match that echo first and each crash would look new (measured on a
+	# bench unit). The line still counted for "last" above: its prefix is the clock of that boot.
+	# Assumes the dmesg <n>[ ts] record prefix with no caller id (no CONFIG_PRINTK_CALLER) and
+	# no console-ramoops record; widen the prefix strip and this rule together if either appears.
+	/^(<[0-9]+>)?crashguard: / { next }
+	/Kernel panic - not syncing:/ && !p { p = $0 }
+	!e && (/Internal error:/ || /Unable to handle kernel/ || /^BUG: / || /soft lockup/ || /hard LOCKUP/ || /detected stall/ || /pretimeout/) { e = $0 }
+	/^pc : / && !pc { pc = substr($0, 6) }
+	/ Comm: / && !cm { s = $0; sub(/.* Comm: /, "", s); sub(/ .*/, "", s); cm = s }
+	END {
+		o = (why ? why : "no-header")
+		if (p) o = o " | " p
+		if (e) o = o " | " e
+		if (pc) o = o " | pc " pc
+		if (cm) o = o " | comm " cm
+		g = o; if (encn) g = g " |" encn
+		if (last != "") o = o " | at uptime " int(last) " s"
+		if (enc) o = o " |" enc
+		gsub(/[\001-\037|]+$/, "", o); gsub(/[\001-\037]/, " ", o)
+		gsub(/[\001-\037|]+$/, "", g); gsub(/[\001-\037]/, " ", g)
+		print substr(o, 1, 400); print substr(g, 1, 400)
+	}'
+}
+
+# ---- S09: archive and release -------------------------------------------------------------
+collect() {
+	mkdir -p "$RUN"; : > "$RUN/state"
+	mnt=
+	if ! pstore_mounted; then
+		grep -q pstore "$R/proc/filesystems" 2>/dev/null || { st pstore=absent; return 0; }
+		mount -t pstore -o nosuid,nodev,noexec,noatime pstore "$PSTORE" 2>/dev/null ||
+			{ st pstore=unmountable; kmsg 3 "cannot mount pstore: crash records UNCHECKED"; return 0; }
+		mnt=1                                   # S10boot mounts it again for everyone else
+	fi
+	# Positive control: an empty directory means "no record" only with a registered backend.
+	if [ "$(cat "$R/sys/module/pstore/parameters/backend" 2>/dev/null)" = ramoops ]; then st pstore=ok
+	else st pstore=nobackend; kmsg 3 "pstore backend is not ramoops: crash records UNCHECKED"; fi
+	set -- "$PSTORE"/*
+	[ -e "$1" ] && records "$@"
+	[ -n "$mnt" ] && umount "$PSTORE"
+	return 0
+}
+
+# copy_in <record> <store>: the archive dir in <store> holding a byte-identical copy of <record>
+# (found through the info sha256 lines, then confirmed with cmp). Never trusts the info line alone.
+copy_in() {
+	h_=$(sha256sum "$1" | cut -d' ' -f1)
+	for i_ in $(grep -ls "^sha256 $h_ " "$2"/*/info); do
+		d_=${i_%/info}; n_=$(sed -n "s/^sha256 $h_ \([^ ]*\) .*/\1/p" "$i_" | head -n 1)
+		[ -n "$n_" ] && cmp -s "$1" "$d_/$n_" && { echo "$d_"; return 0; }
+	done
+	return 1
+}
+# copies_in <store> <record>...: every record has a verified copy in <store>; prints the last dir
+copies_in() { s_=$1; shift; x_=; for f_; do x_=$(copy_in "$f_" "$s_") || return 1; done; echo "$x_"; }
+
+# newdir <store> <bootid>: the next NNNN-<boot8> dir; .seq is kept so numbers are not reused
+newdir() {
+	m_=$(num "$(cat "$1/.seq" 2>/dev/null)")
+	for p_ in "$1"/[0-9][0-9][0-9][0-9]-*/; do
+		[ -d "$p_" ] || continue
+		q_=${p_%/}; q_=${q_##*/}; q_=$(num "$(echo "$q_" | cut -c1-4)"); [ "$q_" -gt "$m_" ] && m_=$q_
+	done
+	m_=$((m_ + 1))
+	put "$1/.seq" "$m_" || return 1
+	d_=$1/$(printf %04d "$m_")-$(echo "$2" | cut -c1-8)
+	mkdir "$d_" 2>/dev/null && echo "$d_"
+}
+
+records() {
+	so=$(summary_of "$@"); sum=$(printf '%s\n' "$so" | sed -n 1p); sig=$(printf '%s\n' "$so" | sed -n 2p)
+	bid=$(bootid); how=fail dest=
+	if on_flash; then
+		mkdir -p "$ARCH" 2>/dev/null && chmod 700 "$ARCH" 2>/dev/null
+		last=$(ls -1d "$ARCH"/[0-9]*/ 2>/dev/null | sort | tail -n 1); last=${last%/}
+		if dest=$(copies_in "$ARCH" "$@"); then
+			how=dup                             # died between copy and release: release again
+		elif [ -n "$last" ] && [ ! -e "$last/acked" ] && [ "$(getv kind "$last/info")" = crash ] &&
+			[ "$(getv sig "$last/info")" = "$sig" ]; then
+			dest=$last                          # a loop repeats itself: count it on the first copy
+			bump "$last" "$bid" && how=repeat
+		else
+			dest=$(newdir "$ARCH" "$bid") && copy_verify "$dest" "$@" && write_info "$dest" "$sum" "$sig" "$bid" "$@" && sync && how=new
+			[ "$how" = new ] || { [ -n "$dest" ] && rm -rf "$dest"; }
+		fi
+		[ "$how" = fail ] && ramcopy "$@"       # flash refused: keep a RAM copy, HOLD the record
+	elif dest=$(copies_in "$RAM" "$@"); then
+		how=known                               # this boot already made a RAM copy
+	else
+		ramcopy "$@"
+	fi
+	case $how in
+	dup|repeat|new)
+		rm -f "$@"
+		if held; then rel="release FAILED, still present: $(ls "$PSTORE" | tr '\n' ' ')"; else rel=released; fi ;;
+	*)
+		if on_flash; then rel="HELD in /sys/fs/pstore (flash write failed, overlay full?): free space and run 'crashguard collect' again, or 'crashguard export' then 'crashguard release'"
+		else rel="HELD in /sys/fs/pstore (no flash overlay: copy it off with 'crashguard export > file.tar', then 'crashguard release'; or reboot to production, where S09 archives it)"; fi ;;
+	esac
+	sk=na
+	if on_flash && [ "$how" != dup ] && [ ! -e "$RUN/streak.done" ]; then
+		sk=$(( $(streak) + 1 )); : > "$RUN/streak.done"
+		mkdir -p "$CG" 2>/dev/null; put "$CG/streak" "$sk" || sk="$sk (not saved: flash full?)"
+	fi
+	sync
+	st "crash=$how dest=$dest streak=$sk"
+	kmsg 2 "CRASH RECORD from an earlier boot: $sum; $how -> ${dest#"$R"}; $rel; consecutive crash boots $sk"
+	[ "$how" = new ] && prune "$dest"
+	return 0
+}
+
+ramcopy() {
+	mkdir -p "$RAM" && chmod 700 "$RAM"
+	dest=$(newdir "$RAM" "$bid") && copy_verify "$dest" "$@" && write_info "$dest" "$sum" "$sig" "$bid" "$@" && how=ramcopy && return 0
+	[ -n "$dest" ] && rm -rf "$dest"; dest=; how=fail; return 1
+}
+
+copy_verify() {
+	d=$1; shift
+	for f; do
+		n=${f##*/}
+		cp "$f" "$d/$n.tmp" 2>/dev/null && cmp -s "$f" "$d/$n.tmp" && mv "$d/$n.tmp" "$d/$n" || { rm -f "$d/$n.tmp"; return 1; }
+		# mtime = the crash wall time from the ramoops header, but never a time in the future:
+		# sysfixtime (S00) sets the boot clock from the newest file under /etc (ecc=0, a bit flip can)
+		[ "$(date -u -r "$f" +%s 2>/dev/null || echo 0)" -le "$(date -u +%s)" ] && touch -r "$f" "$d/$n" 2>/dev/null
+	done
+	sync
+}
+
+write_info() {
+	d=$1 s=$2 g=$3 b=$4; shift 4
+	t=$(for f; do date -u -r "$f" +%s; done | sort -n | head -n 1)
+	put "$d/info" "$(
+		echo "kind=crash"
+		echo "unit=$(unit_id)"
+		echo "board=$(cat "$R/tmp/sysinfo/board_name" 2>/dev/null)"
+		echo "revision=$(sed -n "s/^DISTRIB_REVISION=['\"]*\([^'\"]*\).*/\1/p" "$R/etc/openwrt_release" 2>/dev/null)"
+		echo "summary=$s"
+		echo "sig=$g"
+		echo "crash_time=$(date -u -d "@$t" +%FT%TZ 2>/dev/null) (kernel clock at the crash; no RTC, so a crash before NTP shows the sysfixtime clock)"
+		echo "archived_boot=$b"
+		echo "repeats=1"
+		echo "last_boot=$b"
+		for f; do echo "sha256 $(sha256sum "$f" | cut -d' ' -f1) ${f##*/} $(wc -c < "$f")"; done
+	)"
+}
+
+# bump <archive> <bootid>: repeats+1 and last_boot, as a whole new info (put), checked before use
+bump() {
+	i=$1/info; n=$(( $(num "$(getv repeats "$i")") + 1 ))
+	[ "$(grep -c '^sha256 ' "$i" 2>/dev/null)" -gt 0 ] || return 1
+	new=$(awk -v n="$n" -v b="$2" '/^repeats=/ { print "repeats=" n; next } /^last_boot=/ { print "last_boot=" b; next } { print }' "$i")
+	case $new in *"repeats=$n"*) ;; *) return 1 ;; esac
+	[ "$(printf '%s\n' "$new" | grep -c '^sha256 ')" = "$(grep -c '^sha256 ' "$i")" ] || return 1
+	put "$i" "$new" && sync
+}
+
+over() { [ "$(ls -1d "$ARCH"/[0-9]*/ 2>/dev/null | wc -l)" -gt "$KEEP" ] || [ "$(du -sk "$ARCH" | cut -f1)" -gt "$MAX_KB" ]; }
+# Over the cap: acked archives go first (oldest first). If that is not enough, unacknowledged ones
+# go from the middle: the 2 oldest (usually the most telling) and $1 (the newest) are kept, and each
+# deletion is logged at crit.
+prune() {
+	for pass in acked unacked; do
+		k=0
+		for p in $(ls -1d "$ARCH"/[0-9]*/ 2>/dev/null | sort); do
+			over || return 0
+			p=${p%/}; k=$((k + 1))
+			[ "$p" = "$1" ] && continue
+			if [ "$pass" = acked ]; then [ -e "$p/acked" ] || continue
+			else
+				[ "$k" -le 2 ] && continue
+				kmsg 2 "archive full ($KEEP archives / ${MAX_KB} KiB): deleted UNACKNOWLEDGED ${p##*/}: $(getv summary "$p/info" | cut -c1-120)"
+			fi
+			rm -rf "$p"
+		done
+	done
+}
+
+# ---- U-Boot env (read-only here, except counter_clear) ------------------------------------
+# classify <file of name=value lines>: the bootcmd class of that env
+classify() {
+	c_=$(ev bootcmd "$1")
+	case $c_ in
+	'') echo BLANK ;;
+	"$STOCK_CMD") echo STOCK ;;
+	"$F1_CMD") echo F1 ;;
+	"$GUARD_A_CMD")
+		if [ "$(ev crash_guard "$1")" = "$A_GUARD" ] && [ "$(ev crash_count "$1")" = "$A_COUNT" ] &&
+			[ "$(ev crash_limit "$1")" = "$A_LIMIT" ] && [ "$(ev crash_stop "$1")" = "$A_STOP" ] &&
+			[ "$(ev crash_unpark "$1")" = "$A_UNPARK" ]; then echo GUARD-A; else echo GUARD-DAMAGED; fi ;;
+	"$GUARD_B_CMD")
+		if [ "$(ev crash_guard "$1")" = "$B_GUARD" ] && [ "$(ev crash_count "$1")" = "$B_COUNT" ] &&
+			[ "$(ev crash_stop "$1")" = "$B_STOP" ]; then echo GUARD-B; else echo GUARD-DAMAGED; fi ;;
+	*) echo OTHER ;;
+	esac
+}
+
+# Sets ENV_CLASS (loaded copy, via fw_printenv), ENV_LOOP (ok|WRITING), ENV_SET (counter variables
+# set), and from the two RAW copies: ENV_COPIES (per-copy class), ENV_RAW (problems, one per line),
+# ENV_NOTE; and ENV_INTENT when the class differs from what guard-apply.sh recorded.
+envread() {
+	ENV_CLASS=NA ENV_LOOP=ok ENV_SET= ENV_COPIES= ENV_RAW= ENV_NOTE= ENV_INTENT=
+	ubootmod && command -v fw_printenv >/dev/null 2>&1 || return 0
+	mkdir -p "$R/var/lock" "$RUN"
+	e=$RUN/env.$$
+	if ! fw_printenv > "$e" 2> "$e.err"; then ENV_CLASS=UNREADABLE
+	elif grep -qi 'bad crc' "$e.err"; then ENV_CLASS=BADCRC
+	else
+		ENV_CLASS=$(classify "$e"); [ "$ENV_CLASS" = BLANK ] && ENV_CLASS=UNREADABLE
+		case $ENV_CLASS in F1|GUARD-*) [ "$(ev boot_tftp_forever "$e")" = "$F1_LOOP" ] || ENV_LOOP=WRITING ;; esac
+		for v in $COUNTER; do grep -q "^$v=" "$e" && ENV_SET="$ENV_SET $v"; done
+		ENV_SET=${ENV_SET# }
+	fi
+	rm -f "$e" "$e.err"
+	rawcopies
+	intent
+}
+
+# Each raw copy's own bootcmd, read up to the env's double-NUL end (fw_setenv leaves stale bytes
+# after it). U-Boot loads one copy; the other is the fallback if the loaded one ever fails its CRC.
+rawcopies() {
+	[ "$(awk '!/^#/ && NF {print $1}' "$R/etc/fw_env.config" 2>/dev/null | tr '\n' ' ')" = "/dev/ubi0_0 /dev/ubi0_1 " ] ||
+		{ ENV_COPIES="unchecked (fw_env.config does not name /dev/ubi0_0 and /dev/ubi0_1)"; return 0; }
+	l_= k_=
+	for n_ in 0 1; do
+		vn=$(cat "$R/sys/class/ubi/ubi0_$n_/name" 2>/dev/null); vn=${vn:-ubi0_$n_}
+		if [ "$(cat "$R/sys/class/ubi/ubi0_$n_/upd_marker" 2>/dev/null)" = 1 ]; then
+			cc=INTERRUPTED
+			ENV_RAW="${ENV_RAW}U-Boot env volume $vn has an interrupted update (upd_marker=1): fw_printenv and fw_setenv fail until it is rewritten (README, 'Interrupted env write')
+"
+		else
+			f_=$RUN/raw.$$.$n_
+			if tail -c +6 "$R/dev/ubi0_$n_" 2>/dev/null | tr '\000' '\n' 2>/dev/null | sed '/^$/q' > "$f_" && [ -s "$f_" ]; then
+				cc=$(classify "$f_")
+				case $cc in F1|GUARD-A|GUARD-B) [ "$(ev boot_tftp_forever "$f_")" = "$F1_LOOP" ] || cc="$cc+WRITING-LOOP" ;; esac
+			else cc=UNREADABLE; fi
+			rm -f "$f_"
+			if [ "$ENV_CLASS" != STOCK ]; then
+				case $cc in
+				STOCK) ENV_RAW="${ENV_RAW}U-Boot env copy $vn is STOCK while the loaded copy is $ENV_CLASS: if U-Boot ever falls back to it, the crash trap is armed (T23). Mirror the env: run guard-apply.sh again (or f1-apply.sh and its second write)
+" ;;
+				BLANK) ENV_RAW="${ENV_RAW}U-Boot env copy $vn holds no env (blank, as after a Reset): if the loaded copy fails, U-Boot runs the STOCK defaults (T23). Mirror the env: run guard-apply.sh again (or f1-apply.sh and its second write)
+" ;;
+				*WRITING-LOOP) ENV_RAW="${ENV_RAW}U-Boot env copy $vn has a boot_tftp_forever that can write NAND (T25). Mirror the env
+" ;;
+				esac
+			fi
+		fi
+		l_="$l_ $vn=$cc"; [ -z "$k_" ] && k_=$cc
+		[ "$k_" = "$cc" ] || ENV_NOTE="the two env copies differ (${l_# }): run guard-apply.sh (or the F1 second write) again to mirror them"
+	done
+	ENV_COPIES=${l_# }
+	[ -n "$ENV_RAW" ] && ENV_NOTE=
+	return 0
+}
+
+intent() {
+	i_=$(cut -d' ' -f1 "$CG/intended-env" 2>/dev/null); [ -n "$i_" ] || return 0
+	case $ENV_CLASS in STOCK|F1|GUARD-A|GUARD-B) ;; *) return 0 ;; esac
+	[ "$i_" = "$ENV_CLASS" ] && return 0
+	case $i_ in GUARD-A) m_=A ;; GUARD-B) m_=B ;; F1) m_=f1 ;; *) return 0 ;; esac
+	ENV_INTENT="U-Boot env is $ENV_CLASS but guard-apply.sh set $i_ on this unit ($(cut -d' ' -f2- "$CG/intended-env")): after a Reset or an f1-apply the limiter is gone. Re-apply: guard-apply.sh MODE=$m_ (it writes both copies)"
+}
+
+env_problems() {                # definite env problems, one per line; returns 0 when there is one
+	r_=1
+	case $ENV_CLASS in
+	STOCK) r_=0; echo "U-Boot env is STOCK: a crash now parks this unit in U-Boot or wipes rootfs_data (runbook T23). Re-apply F1 or the crash guard, written to both copies (T26)" ;;
+	BADCRC) r_=0; echo "U-Boot env has a Bad CRC in both copies: U-Boot runs its stock defaults (runbook T23, T26)" ;;
+	GUARD-DAMAGED) r_=0; echo "U-Boot crash-guard text is not a known version: the limiter may not work. Re-apply it (guard-apply.sh)" ;;
+	esac
+	case $ENV_CLASS in F1|GUARD-*) [ "$ENV_LOOP" = WRITING ] && { r_=0; echo "U-Boot boot_tftp_forever is not the RAM-only F1 loop: a TFTP server could write NAND (runbook T25)"; } ;; esac
+	[ -n "$ENV_RAW" ] && { r_=0; printf '%s' "$ENV_RAW"; }
+	[ -n "$ENV_INTENT" ] && { r_=0; echo "$ENV_INTENT"; }
+	return $r_
+}
+env_nd() {                      # the env cannot be classified: "cannot tell", not "clean"
+	case $ENV_CLASS in OTHER|UNREADABLE) echo "U-Boot bootcmd is $ENV_CLASS: cannot tell whether a crash is safe"; return 0 ;; esac
+	return 1
+}
+
+# A counter that should have been cleared and was not: rare crashes, days apart, now add up.
+stuck() {
+	guard && [ -n "$ENV_SET" ] || return 1
+	[ "$(up_s)" -ge $((STABLE_S + 2 * TICK + 60)) ] || return 1
+	w_=$(cat "$RUN/clear" 2>/dev/null); [ -n "$w_" ] || w_="no clear attempt this boot: is 'crashguard watch' running?"
+	case $ENV_CLASS in
+	GUARD-A) c_="crashes even days apart now add up to a PARK" ;;
+	*) c_="crashes even days apart now add up to 1 h back-offs" ;;
+	esac
+	echo "U-Boot crash counter stuck at [$ENV_SET] after $(up_s)s of uptime: $c_ (last clear: $w_)"
+}
+
+# What the U-Boot limiter does next, in words for the push and the status.
+lim_text() {
+	mm=$(dur "$STABLE_S")
+	case $ENV_CLASS in
+	GUARD-B)
+		case " $ENV_SET " in
+		*" crash3 "*) echo "Limiter B: BACKING OFF. 3 or more crash boots in a row: U-Boot waits 1 h before every further attempt while crashes keep coming within $mm of boot." ;;
+		*" crash2 "*) echo "Limiter B: 2nd crash boot in a row. The next crash within $mm of boot makes this unit wait 1 h in U-Boot before each further attempt." ;;
+		*" crash1 "*) echo "Limiter B: 1st crash boot counted. After the 3rd in a row (each within $mm of boot) this unit waits 1 h in U-Boot before each further attempt." ;;
+		*) echo "Limiter B armed; its counter is clear." ;;
+		esac ;;
+	GUARD-A)
+		case " $ENV_SET " in
+		*" crash3 "*) echo "Limiter A: this unit was PARKED after 3 crash boots in a row and resumed after a power cycle. One more crash within $mm of boot parks it again." ;;
+		*" crash2 "*) echo "Limiter A: 2nd crash boot in a row. One more crash within $mm of boot PARKS this unit in U-Boot until a power cycle." ;;
+		*" crash1 "*) echo "Limiter A: 1st crash boot counted. The 3rd in a row (each within $mm of boot) parks this unit in U-Boot until a power cycle." ;;
+		*) echo "Limiter A armed; its counter is clear." ;;
+		esac ;;
+	F1) echo "No crash limiter (F1): a crash loop keeps rebooting." ;;
+	NA) : ;;
+	*) echo "U-Boot env is $ENV_CLASS: see the env alert." ;;
+	esac
+}
+# The silence contract, in crash and limit pushes: every crash episode ends with a "stable" push.
+silence_text() {
+	case $ENV_CLASS in
+	GUARD-B) case " $ENV_SET " in *" crash3 "*) w_="still backing off" ;; *" crash2 "*) w_="crashing again (backing off from the 3rd crash on)" ;; *) w_="crashing again" ;; esac ;;
+	GUARD-A) case " $ENV_SET " in *" crash3 "*) w_="parked again" ;; *" crash2 "*) w_="crashing again (parked from the 3rd crash on)" ;; *) w_="crashing again" ;; esac ;;
+	*) w_="still crash-looping" ;;
+	esac
+	echo "A \"stable\" push follows once this boot has been up $(dur "$STABLE_S"). Silence after this without a \"stable\" push = $w_, or the site is offline."
+}
+
+held_note() {
+	if guard; then echo "records HELD: every reboot now counts as a crash boot toward the U-Boot limit (3 in a row -> $([ "$ENV_CLASS" = GUARD-A ] && echo park || echo '1 h back-off')). Copy them off ('crashguard export') and run 'crashguard release' before rebooting"
+	else echo "not released: a Reset-held power-on or an env rollback now re-arms the stock trap (runbook T23, T26)"; fi
+}
+
+# Linux half of the U-Boot crash limiter: one guarded write, only when a counter variable is set.
+# The outcome is kept in $RUN/clear for 'status' (a counter that stays set is an alarm).
+cres() { echo "$1" > "$RUN/clear"; }
+counter_clear() {
+	mkdir -p "$RUN"; CLEARED=
+	envread
+	guard || return 0                           # never writes a unit without the guard
+	[ -n "$ENV_SET" ] || return 0               # healthy boot: no env write at all
+	was=$ENV_SET
+	on_flash || { cres "refused: RAM recovery, the counter is cleared only in production"; return 1; }
+	[ "$(awk '!/^#/ && NF {print $1}' "$R/etc/fw_env.config" 2>/dev/null | tr '\n' ' ')" = "/dev/ubi0_0 /dev/ubi0_1 " ] &&
+		[ "$(cat "$R/sys/class/ubi/ubi0_0/name" 2>/dev/null)" = ubootenv ] &&
+		[ "$(cat "$R/sys/class/ubi/ubi0_1/name" 2>/dev/null)" = ubootenv2 ] || {
+		cres "refused: fw_env.config does not name ubootenv/ubootenv2"
+		slog err "U-Boot crash counter left set ($was): fw_env.config does not name ubootenv/ubootenv2"; return 1; }
+	held && slog warning "crash record(s) still in /sys/fs/pstore: U-Boot will count the next boot as a crash boot"
+	printf '%s\n' $COUNTER > "$RUN/clear.env"
+	fw_setenv -s "$RUN/clear.env" 2> "$RUN/clear.err"
+	envread
+	if [ -z "$ENV_SET" ] && guard; then
+		cres ok; CLEARED=$was
+		slog warning "cleared the U-Boot crash counter after ${STABLE_S}s of uptime; was: $was"
+		kmsg 5 "cleared the U-Boot crash counter; was: $was"; return 0
+	fi
+	cres "failed: env $ENV_CLASS, still set: $ENV_SET; $(head -n 1 "$RUN/clear.err" 2>/dev/null)"
+	slog err "could not clear the U-Boot crash counter (env $ENV_CLASS, still set: $ENV_SET; $(head -n 1 "$RUN/clear.err" 2>/dev/null))"
+	return 1
+}
+
+# U-Boot stopped (A) or backed off (B) after 3 crash boots: keep that on flash, because the
+# counter itself is cleared after STABLE_S and a decayed record leaves no archive.
+limit_event() {
+	on_flash && [ -n "$ENV_SET" ] || return 0
+	case " $ENV_SET " in *" crash3 "*) ;; *) return 0 ;; esac
+	for p in $(pending); do [ "$(getv kind "$p/info")" = limit ] && return 0; done
+	mkdir -p "$ARCH" && chmod 700 "$ARCH"
+	case $ENV_CLASS in
+	GUARD-A) w="it PARKED this unit after the 3rd crash boot in a row; this boot followed a power cycle" ;;
+	GUARD-B) w="it made this unit wait 1 h in U-Boot after the 3rd crash boot in a row, and does so after every further crash boot" ;;
+	*) w="it stopped retrying after 3 crash boots" ;;
+	esac
+	b=$(bootid); d=
+	d=$(newdir "$ARCH" "$b") && put "$d/info" "kind=limit
+unit=$(unit_id)
+summary=U-Boot crash limit reached ($ENV_CLASS, counter: $ENV_SET): $w
+archived_boot=$b
+repeats=1" && sync && { kmsg 2 "U-Boot crash limit was reached (counter: $ENV_SET); recorded as ${d##*/}"; return 0; }
+	[ -n "$d" ] && rm -rf "$d"
+	kmsg 3 "could not record the U-Boot crash-limit event on flash (overlay full?)"; flash_fail "could not record the U-Boot crash-limit event on flash"
+	return 1
+}
+
+# A write under /etc/crashguard failed in the watch: log it once per boot at err, and keep it as an
+# attention state (status exit 1, LED, one push per boot).
+flash_fail() {
+	mkdir -p "$RUN"; [ -e "$RUN/flash-fail" ] && return 0
+	echo "$1" > "$RUN/flash-fail"; slog err "$1"
+}
+flash_text() { echo "could not write to /etc/crashguard on flash this boot ($(cat "$RUN/flash-fail" 2>/dev/null)): overlay full or read-only? A new crash record will be HELD in pstore and, under the crash guard, every reboot then counts as a crash boot"; }
+
+# The push channel. Its identity for push-verified is a salted SHA-256 prefix of the ntfy URL (of the
+# hook path for another hook): the URL is a secret and is never written or printed.
+push_id() {
+	case $NOTIFY in */crashguard-ntfy) k_=$NTFY_URL_V ;; *) k_=$NOTIFY ;; esac
+	printf '%s|%s' "$1" "$k_" | sha256sum | cut -c1-16
+}
+push_state() {                  # none | unverified | changed | verified
+	[ -n "$NOTIFY" ] || { echo none; return 0; }
+	s_=$(getv salt "$CG/push-verified"); [ -n "$s_" ] || { echo unverified; return 0; }
+	if [ "$(getv push_id "$CG/push-verified")" = "$(push_id "$s_")" ]; then echo verified; else echo changed; fi
+}
+push_check() {
+	case $(push_state) in
+	verified) echo "push channel verified on this unit at $(getv verified_at "$CG/push-verified") (${PUSH_HOST:+ntfy host $PUSH_HOST via }$NOTIFY)"; return 0 ;;
+	none) echo "no push channel (NOTIFY unset or disabled in /etc/crashguard.conf${CONF_ERR:+: $CONF_ERR})" ;;
+	unverified) echo "push channel configured but never verified on this unit: run 'crashguard notify-test' and check the phone" ;;
+	changed) echo "push channel changed since it was verified at $(getv verified_at "$CG/push-verified"): run 'crashguard notify-test' again and check the phone" ;;
+	esac
+	return 1
+}
+# A live guard reports its back-off only by pushes: without a channel it would be silent.
+nopush() { guard && [ -z "$NOTIFY" ] && [ "$NO_PUSH" != yes ]; }
+nopush_text() { echo "crash guard live ($ENV_CLASS) but no push channel: a back-off would be silent. Put NOTIFY and NTFY_URL in /etc/crashguard.conf (private overlay) and run 'crashguard notify-test'; NO_PUSH=yes there only for a unit whose syslog reaches a collector"; }
+
+# ---- alerting -----------------------------------------------------------------------------
+led() {
+	L=$R/sys/class/leds/$LED
+	[ -n "$LED" ] && [ -d "$L" ] || return 0
+	if [ "$1" = on ]; then
+		grep -q '\[timer\]' "$L/trigger" 2>/dev/null && [ -e "$RUN/led" ] && return 0
+		{ echo timer > "$L/trigger" && echo 150 > "$L/delay_on" && echo 1850 > "$L/delay_off"; } 2>/dev/null ||
+			echo 1 2>/dev/null > "$L/brightness"      # no timer trigger: steady on
+		: > "$RUN/led"
+	elif [ -e "$RUN/led" ]; then                   # only undo what this script did
+		{ echo none > "$L/trigger"; echo 0 > "$L/brightness"; } 2>/dev/null
+		rm -f "$RUN/led"
+	fi
+}
+
+notify() {                      # notify <event> <message>: 0 = delivered, 2 = no hook
+	[ -n "$NOTIFY" ] && [ -x "$NOTIFY" ] || return 2
+	CG_CONF=$CONF timeout 60 "$NOTIFY" "$1" "$2" "$(unit_id)" </dev/null >/dev/null 2>&1
+}
+
+ready() {                       # first syslog alert: once a route to the collector exists, or after 300 s
+	ip=$(uci -q get system.@system[0].log_ip) && [ -n "$ip" ] || return 0
+	[ "$1" -ge 300 ] && return 0
+	dv=$(ip -4 route get "$ip" 2>/dev/null | sed -n 's/.* dev \([^ ]*\).*/\1/p')
+	[ -n "$dv" ] || return 1
+	[ -z "$LOG_DEV" ] || [ "$dv" = "$LOG_DEV" ]
+}
+
+msg_archive() {                 # the push text for one archive
+	id=${1##*/} x=$(getv repeats "$1/info") k=$(getv kind "$1/info")
+	case $k in limit) h="CRASH LIMIT" ;; *) h="CRASH x$x" ;; esac
+	echo "$h on unit $(unit_id) ($id): $(getv summary "$1/info")"
+	lim_text
+	silence_text
+	echo "$FIELD"
+	echo "To acknowledge, from this unit's LAN: ssh in and run 'crashguard ack $id'. Until then ONE summary reminder per unit follows every $(dur "$NOTIFY_REPEAT") of uptime."
+}
+msg_reminder() {                # msg_reminder <count> <oldest> <latest> <uptime>
+	t_=$(getv crash_time "$2/info"); t_=${t_%% *}
+	echo "REMINDER, not a new crash: unit $(unit_id) has $1 unacknowledged crash archive(s), oldest ${2##*/}${t_:+ (crash $t_)}, latest ${3##*/}: $(getv summary "$3/info")"
+	lim_text
+	echo "Up $(dur "$4") now. The next reminder follows in $(dur "$NOTIFY_REPEAT") of uptime; a NEW crash is pushed at urgent priority."
+	echo "To stop the reminders, from this unit's LAN: ssh in and run 'crashguard ack all' (or 'crashguard ack <id>')."
+}
+# stable_note <streak before the reset> <counter that was cleared>: the "stable" push, sent by push_pass
+stable_note() {
+	slog notice "stable after ${STABLE_S}s of uptime (crash streak was $1${2:+, U-Boot counter was $2})"
+	[ -n "$NOTIFY" ] || return 0
+	n_=0 l_=; for p in $(pending); do n_=$((n_ + 1)); l_=${p##*/}; done
+	{
+		printf 'STABLE: unit %s up %s' "$(unit_id)" "$(dur "$STABLE_S")"
+		[ "$1" -gt 0 ] && printf ' after %s crash boot(s) in a row' "$1"
+		if [ -n "$2" ]; then
+			printf '; U-Boot crash counter cleared (was: %s), the next crash boot counts from 1' "$2"
+			case $ENV_CLASS/" $2 " in GUARD-B/*" crash3 "*) printf '; the back-off is over' ;; esac
+		else case $ENV_CLASS in F1) printf '; no crash limiter (F1)' ;; esac; fi
+		echo .
+		[ "$n_" -gt 0 ] && echo "$n_ crash archive(s) still unacknowledged, latest $l_: acknowledge from this unit's LAN ('crashguard ack all')."
+	} > "$RUN/stable.msg"
+}
+problems() {                    # keys of the problems pushed once per boot
+	held && echo held
+	env_problems >/dev/null && echo env
+	stuck >/dev/null && echo stuck
+	[ -n "$CONF_ERR" ] && echo conf
+	[ -e "$RUN/flash-fail" ] && echo flash
+	return 0
+}
+msg_problem() {
+	case $1 in
+	held) echo "Crash record(s) NOT released on unit $(unit_id): $(ls "$PSTORE" | tr '\n' ' ')"; held_note ;;
+	env) echo "U-Boot env problem on unit $(unit_id):"; env_problems ;;
+	stuck) echo "On unit $(unit_id): $(stuck)"; lim_text ;;
+	conf) echo "crashguard conf problem on unit $(unit_id): $CONF_ERR" ;;
+	flash) echo "On unit $(unit_id): crashguard $(flash_text)" ;;
+	esac
+	echo "$FIELD"
+}
+msg_heartbeat() {
+	if attention; then s_="NEEDS ATTENTION (from the LAN: crashguard status)"; else s_=clean; fi
+	echo "heartbeat unit $(unit_id): up $(( $1 / 3600 )) h $(( ($1 % 3600) / 60 )) min, $s_, env $ENV_CLASS${ENV_SET:+, counter $ENV_SET}. The next heartbeat is due in $((HEARTBEAT_S / 3600)) h; its absence means down, parked, backing off or crash-looping."
+}
+
+# Push pass: undelivered pushes are retried with a backoff (from one TICK, doubling, capped at 10
+# ticks = 300 s), independent of the syslog cadence, and a pass stops at the first failure.
+# Per archive (urgent): x1, x2, x3, then every 10th repeat, so a fast loop does not flood. What was
+# delivered is kept on flash (.notified) AND in RAM, so a flash that refuses the write (full or
+# read-only) cannot turn every pass into a push. Then the "stable" push, if one is queued. Then ONE
+# summary reminder per unit every NOTIFY_REPEAT of uptime after the last archive push while
+# anything is unacknowledged (default priority). Problems: one push per boot each.
+push_pass() {
+	[ -n "$NOTIFY" ] || return 0
+	[ "$1" -ge "$PUSH_NEXT" ] || return 0
+	mkdir -p "$RUN"
+	pf= pd= pn=0 fp= lp=
+	for p in $(pending); do
+		pn=$((pn + 1)); [ -n "$fp" ] || fp=$p; lp=$p
+		id=${p##*/} x=$(num "$(getv repeats "$p/info")")
+		case $p in "$RAM"/*) k_=r.$id ;; *) k_=f.$id ;; esac
+		nl_=$(num "$(cat "$p/.notified" 2>/dev/null)") nr_=$(num "$(cat "$RUN/notified.$k_" 2>/dev/null)")
+		[ "$nr_" -gt "$nl_" ] && nl_=$nr_           # 0 = never delivered
+		[ "$nl_" = "$x" ] && continue
+		{ [ "$nl_" = 0 ] || [ "$x" -le 3 ] || [ $((x % 10)) = 0 ]; } || continue
+		if notify "$(getv kind "$p/info")" "$(msg_archive "$p")"; then
+			pd=1; echo "$x" > "$RUN/notified.$k_"; echo "$1" > "$RUN/reminded"
+			put "$p/.notified" "$x" || flash_fail "could not record the push of $id on flash (.notified): this boot it is repeated only in the summary reminder (every ${NOTIFY_REPEAT}s of uptime), and pushed once more at the next boot"
+		else pf=1; break; fi
+	done
+	if [ -z "$pf" ] && [ -s "$RUN/stable.msg" ]; then
+		if notify stable "$(cat "$RUN/stable.msg")"; then pd=1; rm -f "$RUN/stable.msg"; else pf=1; fi
+	fi
+	if [ -z "$pf" ] && [ "$pn" -gt 0 ] && [ $(( $1 - $(num "$(cat "$RUN/reminded" 2>/dev/null)") )) -ge "$NOTIFY_REPEAT" ]; then
+		if notify reminder "$(msg_reminder "$pn" "$fp" "$lp" "$1")"; then pd=1; echo "$1" > "$RUN/reminded"; else pf=1; fi
+	fi
+	if [ -z "$pf" ]; then
+		for k in $(problems); do
+			[ -e "$RUN/pushed.$k" ] && continue
+			if notify "$k" "$(msg_problem "$k")"; then pd=1; : > "$RUN/pushed.$k"; else pf=1; break; fi
+		done
+	fi
+	if [ -z "$pf" ] && [ "$HEARTBEAT_S" -gt 0 ] && [ "$1" -ge "$HB_NEXT" ]; then
+		if notify heartbeat "$(msg_heartbeat "$1")"; then pd=1; HB_NEXT=$(( $1 + HEARTBEAT_S )); else pf=1; fi
+	fi
+	if [ -n "$pf" ]; then
+		PUSH_FAILS=$((PUSH_FAILS + 1))
+		[ "$PUSH_FAILS" = 1 ] && slog warning "push not delivered (no network yet?): retrying with a backoff of up to $((TICK * 10))s"
+		PUSH_WAIT=$(( PUSH_WAIT * 2 )); [ "$PUSH_WAIT" -ge "$TICK" ] || PUSH_WAIT=$TICK
+		[ "$PUSH_WAIT" -le $((TICK * 10)) ] || PUSH_WAIT=$((TICK * 10))
+		PUSH_NEXT=$(( $1 + PUSH_WAIT ))
+	else
+		[ -n "$pd" ] && [ "$PUSH_FAILS" -gt 0 ] && slog notice "push delivered after $PUSH_FAILS failed attempt(s)"
+		PUSH_WAIT=0 PUSH_NEXT=0 PUSH_FAILS=0
+	fi
+	return 0
+}
+
+announce() {
+	u=$(unit_id)
+	for p in $(pending); do
+		id=${p##*/} x=$(getv repeats "$p/info") k=$(getv kind "$p/info")
+		slog crit "ALERT unit=$u $k=$id x$x: $(getv summary "$p/info") | streak=$(streak) env=$ENV_CLASS${ENV_SET:+ counter=$ENV_SET} | $(lim_text) | ack: crashguard ack $id"
+	done
+	held && slog crit "ALERT unit=$u crash record(s) not released from /sys/fs/pstore: $(ls "$PSTORE" | tr '\n' ' '); $(held_note)"
+	if m=$(env_problems); then printf '%s\n' "$m" | while IFS= read -r l; do slog crit "ALERT unit=$u $l"; done; fi
+	m=$(env_nd) && slog crit "ALERT unit=$u $m"
+	m=$(stuck) && slog crit "ALERT unit=$u $m"
+	[ -n "$CONF_ERR" ] && slog crit "ALERT unit=$u /etc/crashguard.conf: $CONF_ERR"
+	nopush && slog crit "ALERT unit=$u $(nopush_text)"
+	[ -e "$RUN/flash-fail" ] && slog crit "ALERT unit=$u $(flash_text)"
+	return 0
+}
+
+attention() { [ -n "$(pending)" ] || held || env_problems >/dev/null || env_nd >/dev/null || stuck >/dev/null || [ -n "$CONF_ERR" ] || nopush || [ -e "$RUN/flash-fail" ]; }
+
+watch() {
+	ubus -t 120 wait_for log >/dev/null 2>&1    # logd (S12) is up: logger lines are kept
+	mkdir -p "$RUN"
+	[ -n "$CONF_ERR" ] && slog err "/etc/crashguard.conf: $CONF_ERR"
+	envread; limit_event
+	sent=0 next=0 envnext=300 stable_done= clear_next=0 PUSH_NEXT=0 PUSH_WAIT=0 PUSH_FAILS=0 HB_NEXT=$STABLE_S
+	while :; do
+		now=$(up_s)
+		[ "$now" -ge "$envnext" ] && { envread; envnext=$((now + 300)); }
+		if [ -z "$stable_done" ] && [ "$now" -ge "$STABLE_S" ]; then
+			sk0=$(streak)
+			if on_flash && [ "$sk0" -gt 0 ]; then put "$CG/streak" 0 || flash_fail "could not reset the crash streak on flash"; fi
+			# a "stable" push closes every crash episode: the counter was cleared, or a streak ended
+			if counter_clear && { [ -n "$CLEARED" ] || [ "$sk0" -gt 0 ]; }; then stable_note "$sk0" "$CLEARED"; fi
+			stable_done=1; clear_next=$((now + CLEAR_RETRY))
+		elif [ -n "$stable_done" ] && guard && [ -n "$ENV_SET" ] && [ "$now" -ge "$clear_next" ]; then
+			counter_clear && [ -n "$CLEARED" ] && stable_note "$sk0" "$CLEARED"
+			clear_next=$((now + CLEAR_RETRY))                    # retry a failed or refused clear hourly
+		fi
+		if attention; then
+			led on
+			if [ "$now" -ge "$next" ] && ready "$now"; then
+				announce "$now"; sent=$((sent + 1))
+				if [ "$sent" -lt 2 ]; then next=$((now + 300)); else next=$((now + INTERVAL)); fi
+			fi
+			push_pass "$now"
+		else
+			led off
+			push_pass "$now"                        # a queued "stable" push, the heartbeat
+			[ -n "$stable_done" ] && [ "$HEARTBEAT_S" = 0 ] && [ ! -s "$RUN/stable.msg" ] && return 0
+		fi
+		sleep "$TICK"
+	done
+}
+
+# ---- operator commands --------------------------------------------------------------------
+status() {
+	rc=0 nd=0
+	for p in $(pending); do
+		rc=1
+		case $p in "$RAM"/*) w="RAM only, lost at reboot" ;; *) w=flash ;; esac
+		echo "UNACKNOWLEDGED $(getv kind "$p/info") ${p##*/} x$(getv repeats "$p/info") ($w): $(getv summary "$p/info")"
+		[ "$1" = -v ] && sed 's/^/    /' "$p/info"
+	done
+	[ "$(streak)" -gt 1 ] && echo "consecutive crash boots: $(streak) (resets after ${STABLE_S}s of uptime)"
+	envread
+	if pstore_mounted; then
+		held && { rc=1; echo "LIVE CRASH RECORD(S) in /sys/fs/pstore: $(ls "$PSTORE" | tr '\n' ' ')"; echo "  $(held_note)"; }
+	elif grep -q pstore "$R/proc/filesystems" 2>/dev/null; then
+		nd=1; echo "NOT DETERMINED: pstore is not mounted (an unmounted pstore reads as empty)"
+	fi
+	case $(getv pstore "$RUN/state") in nobackend|unmountable) nd=1; echo "NOT DETERMINED: at boot pstore was $(getv pstore "$RUN/state")" ;; esac
+	m=$(env_problems) && { rc=1; echo "$m"; }
+	m=$(env_nd) && { nd=1; echo "$m"; }
+	m=$(stuck) && { rc=1; echo "$m"; }
+	[ -n "$CONF_ERR" ] && { rc=1; echo "/etc/crashguard.conf: $CONF_ERR"; }
+	nopush && { rc=1; nopush_text; }
+	[ -e "$RUN/flash-fail" ] && { rc=1; flash_text; }
+	if [ -n "$ENV_SET" ]; then
+		echo "U-Boot crash counter: $ENV_SET (cleared after ${STABLE_S}s of uptime in production)"
+		m=$(lim_text) && [ -n "$m" ] && echo "  $m"
+	fi
+	guard && echo "note: crash guard live ($ENV_CLASS): never install an image without crashguard; run guard-apply.sh MODE=f1 first"
+	[ -n "$ENV_NOTE" ] && echo "note: $ENV_NOTE"
+	ps_=$(push_state)
+	case $ps_ in
+	none) if guard; then [ "$NO_PUSH" = yes ] && echo "note: crash guard live without a push channel (NO_PUSH=yes): a back-off is reported only to syslog and on the LED"
+		else echo "note: no push channel (NOTIFY unset in /etc/crashguard.conf): alerts stay on this unit"; fi ;;
+	unverified|changed) echo "note: $(push_check)" ;;
+	esac
+	if [ "$1" = -v ]; then
+		echo "env=$ENV_CLASS loop=$ENV_LOOP counter=[$ENV_SET] copies=[$ENV_COPIES] streak=$(streak) archives=$(ls -1d "$ARCH"/[0-9]*/ 2>/dev/null | wc -l)"
+		if [ -n "$NOTIFY" ]; then p_="${PUSH_HOST:+ntfy host $PUSH_HOST via }$NOTIFY ($ps_)"; else p_=none; fi
+		echo "push=$p_ heartbeat=$([ "$HEARTBEAT_S" = 0 ] && echo off || echo "${HEARTBEAT_S}s") stable=${STABLE_S}s clear=$(cat "$RUN/clear" 2>/dev/null)"
+	fi
+	[ "$rc" = 1 ] && return 1
+	[ "$nd" = 1 ] && return 3
+	return 0
+}
+
+banner() {
+	o=$(status 2>&1) && return 0
+	echo
+	echo " === CRASH ALERT (crashguard) ======================================="
+	printf '%s\n' "$o" | sed 's/^/ /'
+	echo " --------------------------------------------------------------------"
+	echo " Details: crashguard status -v      Acknowledge: crashguard ack <id>|all"
+	echo " Before any 'sysupgrade -n', Reset-held power-on or U-Boot env rollback,"
+	echo " 'crashguard status' must exit 0 (runbook T26)."
+	echo " At the unit, if the network is down: unplug the router, count to 60,"
+	echo " plug it back in. NEVER hold Reset (it can bring back the crash trap)."
+	echo " ===================================================================="
+	echo
+}
+
+ack() {
+	[ -n "$1" ] || { echo "usage: crashguard ack <id>|all   (ids: crashguard list)" >&2; return 2; }
+	who=${SSH_CLIENT%% *}; who=${who:-console}; n=0 fl=0
+	for p in $(pending); do
+		[ "$1" = all ] || [ "$1" = "${p##*/}" ] || continue
+		if put "$p/acked" "acked_at=$(date -u +%FT%TZ) acked_from=$who acked_boot=$(bootid)"; then n=$((n + 1))
+		else fl=1; echo "FAILED to write ${p##*/}/acked (overlay full?)" >&2; fi
+	done
+	sync
+	if [ "$n" -gt 0 ]; then
+		slog notice "acknowledged $n crash archive(s) ($1) from $who"
+		notify ack "unit=$(unit_id) acknowledged $n ($1) from $who"
+	fi
+	echo "acknowledged: $n (the LED stops within ${TICK}s if nothing else needs attention)"
+	[ "$fl" = 0 ] || return 1
+	[ "$n" -gt 0 ] || [ "$1" = all ] || { echo "no unacknowledged archive named $1" >&2; return 1; }
+	return 0
+}
+
+# RAM copies to stdout as a tar; on success each is marked releasable ('.exported'). This proves
+# only that the unit wrote the tar: check the file on your side before 'crashguard release'.
+export_ram() {
+	set -- "$RAM"/[0-9]*/
+	[ -d "$1" ] || { echo "nothing to export: no RAM copies" >&2; return 1; }
+	tar -C "$RUN" -cf - archive || { echo "export FAILED" >&2; return 1; }
+	for d; do : > "${d}.exported"; done
+	echo "exported $# RAM cop(ies) to stdout; 'crashguard release' may now delete their records" >&2
+}
+
+release() {
+	pstore_mounted || { echo "ABORT: pstore not mounted"; return 1; }
+	for f in "$PSTORE"/*; do
+		[ -e "$f" ] || continue
+		copy_in "$f" "$ARCH" >/dev/null && continue                  # verified flash copy
+		d=$(copy_in "$f" "$RAM") && [ -e "$d/.exported" ] && continue  # exported RAM copy
+		[ "$1" = --force ] && continue
+		echo "ABORT: ${f##*/} has no verified copy on flash and no exported RAM copy. Copy it off ('crashguard export > file.tar' from the laptop), then 'crashguard release'; or 'crashguard release --force'"
+		return 1
+	done
+	for f in "$PSTORE"/*; do [ -e "$f" ] && rm -f "$f"; done
+	held && { echo "FAIL: still present: $(ls "$PSTORE" | tr '\n' ' ')"; return 1; }
+	echo "RELEASED"
+}
+
+# Test hook: CG_LIB=1 defines the functions without dispatching.
+[ "${CG_LIB:-}" = 1 ] && return 0 2>/dev/null
+
+case "$1" in
+collect) collect; exit 0 ;;                 # never reads the conf
+esac
+conf_load
+case "$1" in
+watch) watch ;;
+status) status "$2" ;;
+banner) banner ;;
+list) for p in "$ARCH"/[0-9]*/ "$RAM"/[0-9]*/; do [ -f "${p}info" ] &&
+	echo "${p%/} $([ -e "${p}acked" ] && echo acked || echo UNACKED) $(getv summary "${p}info")"; done; exit 0 ;;
+show) [ -n "$2" ] && cat "$ARCH/$2/info" "$ARCH/$2/acked" "$RAM/$2/info" 2>/dev/null ;;
+ack) ack "$2" ;;
+export) export_ram ;;
+release) release "$2" ;;
+notify-test)
+	notify test "crashguard test from unit=$(unit_id) at $(date -u +%FT%TZ)"; r=$?
+	echo "notify rc=$r (0 = delivered and confirmed by the server, 1 = not delivered, 2 = no hook configured, 4 = NTFY_URL invalid)"
+	[ -n "$CONF_ERR" ] && echo "conf: $CONF_ERR"
+	if [ "$r" = 0 ] && [ "$CONF" != "$R/etc/crashguard.conf" ]; then
+		echo "not recorded as verified: CG_CONF is not /etc/crashguard.conf"
+	elif [ "$r" = 0 ]; then
+		s=$(tr -cd '0-9a-f' 2>/dev/null < "$R/proc/sys/kernel/random/uuid"); [ -n "$s" ] || s=$(bootid | tr -cd '0-9a-f')$(date +%s)
+		mkdir -p "$CG" 2>/dev/null
+		if ( umask 077; put "$CG/push-verified" "verified_at=$(date -u +%FT%TZ)
+host=${PUSH_HOST:-none}
+salt=$s
+push_id=$(push_id "$s")
+by=crashguard notify-test: the server accepted the push; only the phone proves that it arrived"; ); then
+			echo "recorded /etc/crashguard/push-verified. Now CHECK THE PHONE: the push must be there (title 'crashguard test $(unit_id)')"
+		else echo "could not record /etc/crashguard/push-verified (overlay full?)"; r=1; fi
+	fi
+	exit $r ;;
+push-check) push_check; exit $? ;;
+*) echo "usage: crashguard status [-v] | list | show <id> | ack <id>|all | export | release [--force] | notify-test | push-check" >&2; exit 2 ;;
+esac

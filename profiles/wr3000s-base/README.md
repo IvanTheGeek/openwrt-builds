@@ -36,6 +36,7 @@ The same as `wr3000h-base`; its README explains the reasons behind each choice.
 | LuCI | present; kept off WAN/transit by the **firewall zone**, not by a pinned address |
 | Diagnostics | `iw` (per-antenna signal, station and link details) and `iperf3` (throughput); used for the per-unit Wi-Fi radio test |
 | Internet lamp | follows the WAN port's link (`netdev` trigger on `wan`, mode `link`); **S-only** |
+| Crash alert | **crashguard**: at boot (S09, before the modules load) archives a kernel crash record from pstore to flash, then alerts until someone acknowledges it (LED, syslog, ntfy push); on a unit that also runs the U-Boot crash limiter it clears the limiter's counter once the boot is stable. The image never touches the U-Boot env: the limiter is a separate, per-unit step |
 
 ## Overlays
 
@@ -50,13 +51,27 @@ The same as `wr3000h-base`; its README explains the reasons behind each choice.
   The shared files are copies rather than `common/files/` because the mule and GL.iNet
   profiles do not ship OpenSSH, and moving dropbear to :2222 on those images would lock them
   out.
+- **crashguard** (`usr/sbin/crashguard`, `etc/init.d/crashguard`, `etc/profile.d/10-crashguard.sh`,
+  `lib/upgrade/keep.d/crashguard`, `usr/libexec/crashguard-ntfy`) is a **copy**: the sources and
+  their tests are maintained elsewhere, and a check compares these five files byte for byte (and their
+  exec bits) against them. **Do not edit them here;** change the source, then copy. They are shipped
+  by the overlay, not by a package, so no package post-install enables the service:
+  `etc/rc.d/S09crashguard -> ../init.d/crashguard` does. (The image build's own `prepare_rootfs`
+  enables every `/etc/init.d` script with an `rc.common` shebang as well, which writes the same link;
+  the committed link keeps the enable independent of that.) `crashguard status` on a unit: exit 0 is
+  clean, 1 needs attention, 3 cannot tell.
+- **crashguard's conf is private.** `/etc/crashguard.conf` (the ntfy topic) comes only from
+  `$OPENWRT_PRIVATE/wr3000s-base/files/etc/crashguard.conf`, mode `600`; `build.sh` refuses an image
+  without it, with the template placeholder, or with a looser mode (top-level README). A
+  keep-settings sysupgrade does not keep it (`keep.d` keeps only `/etc/crashguard/`), so every image
+  brings its own and a topic change is a rebuild.
 - ⚠️ **uci-defaults cannot use `logger`.** They run in `S10boot`, before `S12log` starts logd, so
   a first boot's `logger` output is lost. `98-homelab-internet-led` writes to `/dev/kmsg`
   instead, which the ring buffer keeps and `logread`/`dmesg` show.
 - **Private** (`$OPENWRT_PRIVATE/wr3000s-base/files/`): the same fleet-wide base keys
   (`openwrt-base-openssh-20260908`, `openwrt-base-breakglass-20260908`), base root password
-  and `99-homelab-syslog` as `wr3000h-base`. The keys are replaced by per-unit keys at
-  commissioning.
+  and `99-homelab-syslog` as `wr3000h-base`, plus `etc/crashguard.conf` (S-only). The keys are
+  replaced by per-unit keys at commissioning.
 
 ## Build
 

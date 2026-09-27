@@ -13,7 +13,8 @@ needs this profile. Sysupgrade refuses the wrong layout's image; never force it 
 ## How it is built
 
 - **`overlay-from`** names `wr3000s-base`. `build.sh` merges that profile's public *and* private
-  overlays, so both profiles carry the same keys, password hash and settings from one copy.
+  overlays, so both profiles carry the same keys, password hash and settings from one copy,
+  crashguard and its private conf included.
 - **`seed`** is `wr3000s-base`'s seed with the device switched. It also states
   `CONFIG_TARGET_ROOTFS_INITRAMFS=y`, which the TFTP recovery image needs; that is already the
   default on this target. `build.sh` refuses to build if the two seeds differ outside

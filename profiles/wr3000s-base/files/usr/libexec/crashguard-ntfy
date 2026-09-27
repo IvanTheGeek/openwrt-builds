@@ -1,0 +1,38 @@
+#!/bin/sh
+# crashguard push hook for ntfy over HTTPS. DRAFT v2 (round 2) 2026-09-26, not run on a router.
+#   crashguard-ntfy <event> <message> [<unit>]
+# Exit 0 only when ntfy answered with a message event; 1 = not delivered (crashguard retries with a
+# backoff); 2 = no NTFY_URL configured; 4 = NTFY_URL invalid or still the template placeholder.
+# The topic URL is a bearer secret: it lives only in /etc/crashguard.conf from the PRIVATE overlay
+# (NTFY_URL=https://ntfy.sh/<topic>), typed by the owner, never in this public file or in chat.
+# The conf is parsed, never sourced: only the NTFY_URL line is read.
+# Title, priority and tags go as ntfy query parameters (?title=&priority=&tags=), not as
+# uclient-fetch --header options: both uclient-fetch --header and ntfy's query-parameter support are
+# INFERRED, not verified on the router; the bench push test (bench-plan.txt phase 2) checks them.
+# Also unverified: uclient-fetch's exit code on an HTTP error, so the response body is checked too.
+CONF=${CG_CONF:-${CG_ROOT}/etc/crashguard.conf}   # CG_ROOT: laptop tests only
+[ -r "$CONF" ] || exit 2
+u=$(tr -d '\r' < "$CONF" | sed -n 's/^[[:space:]]*NTFY_URL[[:space:]]*=//p' | tail -n 1 |
+	sed 's/[[:space:]][[:space:]]*#.*$//; s/^[[:space:]]*//; s/[[:space:]]*$//')
+case $u in \"*\") u=${u#\"}; u=${u%\"} ;; \'*\') u=${u#\'}; u=${u%\'} ;; esac
+[ -n "$u" ] || exit 2
+case $u in *REPLACE-WITH*) exit 4 ;; esac
+printf '%s\n' "$u" | grep -qE '^https://[A-Za-z0-9.-]+(:[0-9]+)?(/[A-Za-z0-9_.-]+)+$' || exit 4
+ev=$(printf '%s' "$1" | tr -cd 'a-z')
+unit=$(printf '%s' "${3:-unknown}" | tr -cd 'A-Za-z0-9')
+# Priorities: urgent only for a NEW crash or limit (and records that could not be released); the
+# daily summary reminder and the "stable" push that closes a crash episode at default priority.
+case $ev in
+crash|limit|held) p=urgent t=rotating_light ;;
+env|stuck|conf|flash) p=high t=warning ;;
+stable) p=default t=white_check_mark ;;
+reminder) p=default t=bell ;;
+ack) p=low t=white_check_mark ;;
+heartbeat) p=min t=green_heart ;;
+*) ev=test p=min t=test_tube ;;
+esac
+url="$u?title=crashguard%20$ev%20${unit:-unknown}&priority=$p&tags=$t"
+m=$(printf '%s' "$2" | head -c 3500)                # ntfy keeps up to 4096 bytes as a message
+b=$(uclient-fetch -q --timeout=20 -O - --post-data="$m" "$url" 2>/dev/null </dev/null) || exit 1
+case $b in *'"event":"message"'*) exit 0 ;; esac
+exit 1
