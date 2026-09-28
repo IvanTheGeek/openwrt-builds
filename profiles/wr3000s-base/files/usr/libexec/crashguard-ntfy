@@ -27,11 +27,13 @@ crash|limit|held) p=urgent t=rotating_light ;;
 env|stuck|conf|flash) p=high t=warning ;;
 stable) p=default t=white_check_mark ;;
 reminder) p=default t=bell ;;
+uplink) p=high t=satellite_antenna ;;   # a site AP's uplink guard: DOWN / UP (not a crash)
 ack) p=low t=white_check_mark ;;
 heartbeat) p=min t=green_heart ;;
 *) ev=test p=min t=test_tube ;;
 esac
-url="$u?title=crashguard%20$ev%20${unit:-unknown}&priority=$p&tags=$t"
+case $ev in uplink) ttl=uplink ;; *) ttl=crashguard%20$ev ;; esac
+url="$u?title=$ttl%20${unit:-unknown}&priority=$p&tags=$t"
 m=$(printf '%s' "$2" | head -c 3500)                # ntfy keeps up to 4096 bytes as a message
 b=$(uclient-fetch -q --timeout=20 -O - --post-data="$m" "$url" 2>/dev/null </dev/null) || exit 1
 case $b in *'"event":"message"'*) exit 0 ;; esac
