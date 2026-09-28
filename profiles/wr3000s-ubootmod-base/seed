@@ -54,3 +54,7 @@ CONFIG_PACKAGE_procps-ng-pkill=y
 CONFIG_PACKAGE_diffutils=y
 CONFIG_PACKAGE_tcpdump=y
 CONFIG_PACKAGE_less=y
+# WireGuard (kernel module, wg tools, LuCI protocol): lets a unit behind carrier-grade NAT dial out to a WireGuard hub
+CONFIG_PACKAGE_kmod-wireguard=y
+CONFIG_PACKAGE_wireguard-tools=y
+CONFIG_PACKAGE_luci-proto-wireguard=y

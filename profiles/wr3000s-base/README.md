@@ -35,6 +35,7 @@ The same as `wr3000h-base`; its README explains the reasons behind each choice.
 | Logging | syslog to the estate's central collector, udp/514; the address is set in the private overlay |
 | LuCI | present; kept off WAN/transit by the **firewall zone**, not by a pinned address |
 | Diagnostics | `iw` (per-antenna signal, station and link details) and `iperf3` (throughput); used for the per-unit Wi-Fi radio test |
+| WireGuard | `kmod-wireguard`, `wireguard-tools` (`wg` and netifd's `wireguard` protocol) and `luci-proto-wireguard`, so a unit behind carrier-grade NAT can dial out to a WireGuard hub. **Packages only: this profile configures no tunnel.** A tunnel set up on a unit is ordinary UCI config, private key included: a keep-settings sysupgrade carries it, while `sysupgrade -n` or a factory reset erases it; **S-only** |
 | Internet lamp | follows the WAN port's link (`netdev` trigger on `wan`, mode `link`); **S-only** |
 | Crash alert | **crashguard**: at boot (S09, before the modules load) archives a kernel crash record from pstore to flash, then alerts until someone acknowledges it (LED, syslog, ntfy push); on a unit that also runs the U-Boot crash limiter it clears the limiter's counter once the boot is stable. The image never installs or changes the limiter (a separate, per-unit step); on a unit that has it, crashguard only deletes the counter variables once the boot is stable. Never flash an image WITHOUT crashguard (e.g. `--mainline`) onto a unit that runs the limiter: nothing would clear its counter |
 
