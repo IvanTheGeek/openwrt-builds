@@ -132,6 +132,11 @@ any overlay that still carries the marker (it prints the file names, never conte
 dialog or an existing 0600 file, and `--check` tells whether it is filled in, without showing it. Its
 dialog captures live in a private tmpfs directory, never in the overlay tree, and `build.sh` refuses an
 overlay that still holds one of its `.psk-*` temporary files (as it refuses `*.plain` and `*.age-key`).
+[`tools/set-site-bh-key.sh`](tools/set-site-bh-key.sh) does the same for a key nobody types (a wireless
+link between two units of a site): `--generate` writes 63 random `[A-Za-z0-9]` characters straight into
+the site's `backhaul.psk`, never printed (it names the file, its mode and a 12-hex digest); `--check`
+answers yes/no; it never overwrites a key, and `--rotate --both-ends-on-site` is for a rotation with a
+person at both units. Its temporary file is a `.psk-bh.*`, covered by the same stray guard.
 
 **crashguard's conf.** An image whose overlay carries `usr/sbin/crashguard` (the WR3000S base overlay
 does, see [`profiles/wr3000s-base`](profiles/wr3000s-base/README.md)) must also carry
